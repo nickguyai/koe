@@ -1,18 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
-
-contextBridge.exposeInMainWorld('widgetAPI', {
-  toggleRecording: () => ipcRenderer.send('widget-toggle-recording'),
-  onStateUpdate: (cb: (state: { status: string }) => void) => {
-    ipcRenderer.removeAllListeners('widget-state-update');
-    ipcRenderer.on('widget-state-update', (_event, state) => cb(state));
-  },
-});
-
-declare global {
-  interface Window {
-    widgetAPI?: {
-      toggleRecording: () => void;
-      onStateUpdate: (cb: (state: { status: string }) => void) => void;
-    };
-  }
-}
+// Re-export shim — canonical location is now src/ui/widget-preload.ts
+// Note: widget-preload is an Electron preload script, not a typical module.
+// This shim exists for import consistency; the build should use the canonical location.
+export {};

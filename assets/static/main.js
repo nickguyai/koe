@@ -19,8 +19,12 @@ let toastNode = null;
 let toastTimer = null;
 let activeView = 'home';
 let selectedTranscription = null;
+let summaryReturnView = null; // tracks where to return when leaving summary
+let detailReturnView = null;  // tracks where to return when leaving detail
 let detailAudioUrl = null;
 let detailAudioRequestId = 0;
+let summaryAudioUrl = null;
+let summaryAudioRequestId = 0;
 
 // Pre-warm microphone stream to avoid clipping on first recording
 async function initMicrophoneStream() {
@@ -317,6 +321,7 @@ const libraryView = document.getElementById('libraryView');
 const jobsView = document.getElementById('jobsView');
 const settingsView = document.getElementById('settingsView');
 const detailView = document.getElementById('detailView');
+const meetingSummaryView = document.getElementById('meetingSummaryView');
 
 // Navigation
 const navTabs = document.querySelectorAll('.nav-tab');
@@ -800,6 +805,12 @@ const api = {
         }
         return null;
     },
+    async generateMeetingNotes(jobId) {
+        if (window.electronAPI && window.electronAPI.generateMeetingNotes) {
+            return window.electronAPI.generateMeetingNotes(jobId);
+        }
+        return null;
+    },
     async polishJob(jobId) {
         if (window.electronAPI && window.electronAPI.polishTranscriptionJob) {
             return window.electronAPI.polishTranscriptionJob({ jobId });
@@ -847,6 +858,12 @@ const api = {
             return window.electronAPI.shareMeetingToNotion({ jobId });
         }
         return { ok: false, message: 'Notion sharing unavailable in web mode' };
+    },
+    async updateActionItems(jobId, completedItems) {
+        if (window.electronAPI && window.electronAPI.updateActionItems) {
+            return window.electronAPI.updateActionItems({ jobId, completedItems });
+        }
+        return null;
     }
 };
 
@@ -989,6 +1006,7 @@ async function retranscribeJob(jobId) {
         if (jobIndex >= 0) {
             jobs[jobIndex].status = 'pending';
             jobs[jobIndex].progress = 0;
+            jobs[jobIndex].isRetranscribe = true;
         } else {
             jobs.unshift({
                 id: jobId,
@@ -996,7 +1014,8 @@ async function retranscribeJob(jobId) {
                 status: 'pending',
                 diarization_status: null,
                 progress: 0,
-                created_at: new Date().toISOString()
+                created_at: new Date().toISOString(),
+                isRetranscribe: true
             });
         }
         renderJobsList();
@@ -1269,10 +1288,13 @@ async function deleteTranscription(jobId) {
 function switchView(viewName) {
     activeView = viewName;
     selectedTranscription = null;
+    summaryReturnView = null;
+    detailReturnView = null;
     cleanupDetailAudio();
+    cleanupSummaryAudio();
 
     // Hide all views
-    [homeView, libraryView, jobsView, settingsView, detailView].forEach(view => {
+    [homeView, libraryView, jobsView, settingsView, detailView, meetingSummaryView].forEach(view => {
         if (view) view.style.display = 'none';
     });
 
@@ -1301,17 +1323,316 @@ function switchView(viewName) {
     }
 }
 
-function showTranscriptionDetail(transcription) {
+function showTranscriptionDetail(transcription, fromView) {
+    cleanupSummaryAudio();
     selectedTranscription = transcription;
+    detailReturnView = fromView || null;
 
     // Hide other views
-    [homeView, libraryView, jobsView, settingsView].forEach(view => {
+    [homeView, libraryView, jobsView, settingsView, meetingSummaryView].forEach(view => {
         if (view) view.style.display = 'none';
     });
 
     // Render detail view
     renderDetailView(transcription);
     if (detailView) detailView.style.display = 'block';
+}
+
+function showMeetingSummary(transcription, fromView) {
+    cleanupDetailAudio();
+    cleanupSummaryAudio();
+    selectedTranscription = transcription;
+    summaryReturnView = fromView || null;
+
+    // Hide other views
+    [homeView, libraryView, jobsView, settingsView, detailView].forEach(view => {
+        if (view) view.style.display = 'none';
+    });
+
+    // Clear nav tab active state (summary is not a nav tab destination)
+    navTabs.forEach(tab => tab.classList.remove('active'));
+
+    renderMeetingSummary(transcription);
+    if (meetingSummaryView) meetingSummaryView.style.display = 'block';
+}
+
+function renderMeetingSummary(transcription) {
+    if (!meetingSummaryView) return;
+
+    const meetingNotes = transcription.meetingNotes;
+    if (!meetingNotes) {
+        meetingSummaryView.innerHTML = `
+            <div class="animate-float-up">
+                <button class="detail-back-btn" id="summaryBackBtn">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <polyline points="9 18 15 12 9 6"></polyline>
+                    </svg>
+                    <span>Back</span>
+                </button>
+                <div class="summary-empty" id="summaryEmptyContainer">
+                    <p>No meeting notes available yet.</p>
+                    <button class="detail-action-btn" id="generateNotesBtn" title="Generate meeting notes from transcript">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M12 20h9"></path>
+                            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+                        </svg>
+                        <span>Generate Notes</span>
+                    </button>
+                </div>
+            </div>
+        `;
+        const backBtn = document.getElementById('summaryBackBtn');
+        if (backBtn) backBtn.addEventListener('click', () => {
+            if (summaryReturnView === 'detail') {
+                showTranscriptionDetail(transcription);
+            } else {
+                switchView(activeView === 'library' ? 'library' : 'home');
+            }
+        });
+        const generateBtn = document.getElementById('generateNotesBtn');
+        if (generateBtn) generateBtn.addEventListener('click', async () => {
+            const container = document.getElementById('summaryEmptyContainer');
+            if (container) {
+                container.innerHTML = '<p>Generating meeting notes...</p><div class="summary-spinner"></div>';
+            }
+            try {
+                const result = await api.generateMeetingNotes(transcription.id);
+                if (result && result.meeting_notes) {
+                    transcription.meetingNotes = result.meeting_notes;
+                    renderMeetingSummary(transcription);
+                } else {
+                    if (container) container.innerHTML = '<p>Failed to generate meeting notes. Please try again.</p>';
+                }
+            } catch (err) {
+                if (container) container.innerHTML = `<p>Error: ${escapeHtml(err.message || 'Generation failed')}</p>`;
+            }
+        });
+        return;
+    }
+
+    const title = escapeHtml(transcription.title);
+    const date = escapeHtml(transcription.date);
+    const duration = escapeHtml(transcription.duration);
+
+    // Load persisted action item completion state
+    const completedItems = (meetingNotes._completedItems || []);
+
+    const actionItemsHtml = (meetingNotes.action_items || []).map((item, i) => {
+        const checked = completedItems.includes(i) ? 'checked' : '';
+        const doneClass = completedItems.includes(i) ? ' done' : '';
+        return `
+            <label class="summary-action-item${doneClass}">
+                <input type="checkbox" class="summary-action-checkbox" data-index="${i}" ${checked}>
+                <span class="summary-action-text">${escapeHtml(item)}</span>
+            </label>
+        `;
+    }).join('');
+
+    const listHtml = (items) => {
+        if (!items || items.length === 0) {
+            return '<p class="summary-empty-text">None recorded.</p>';
+        }
+        return `
+            <ul class="summary-list">
+                ${items.map((item) => `<li class="summary-list-item">${escapeHtml(item)}</li>`).join('')}
+            </ul>
+        `;
+    };
+
+    const audioHtml = transcription.hasAudio ? `
+        <div class="summary-audio" id="summaryAudioContainer">
+            <audio id="summaryAudioPlayer" controls preload="metadata"></audio>
+        </div>
+    ` : '';
+
+    meetingSummaryView.innerHTML = `
+        <div class="animate-float-up">
+            <button class="detail-back-btn" id="summaryBackBtn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <polyline points="9 18 15 12 9 6"></polyline>
+                </svg>
+                <span>Back</span>
+            </button>
+
+            <div class="summary-header">
+                <div class="summary-header-info">
+                    <h1 class="summary-title font-display">${title}</h1>
+                    <div class="summary-meta">
+                        <span>${date}</span>
+                        <span>·</span>
+                        <span>${duration}</span>
+                        <span class="meeting-badge">Meeting</span>
+                    </div>
+                </div>
+                <div class="summary-actions">
+                    <button class="detail-action-btn" id="summaryCopyMarkdownBtn" title="Copy meeting markdown">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="4" y="2" width="16" height="20" rx="2"></rect>
+                            <line x1="8" y1="7" x2="16" y2="7"></line>
+                            <line x1="8" y1="11" x2="16" y2="11"></line>
+                            <line x1="8" y1="15" x2="13" y2="15"></line>
+                        </svg>
+                        <span>Copy Markdown</span>
+                    </button>
+                    <button class="detail-action-btn" id="summaryShareEmailBtn" title="Share by email">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+                            <polyline points="3 7 12 13 21 7"></polyline>
+                        </svg>
+                        <span>Email</span>
+                    </button>
+                    <button class="detail-action-btn" id="summaryShareNotionBtn" title="Open in Notion">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                            <path d="M8 16V8l7 8V8"></path>
+                        </svg>
+                        <span>Notion</span>
+                    </button>
+                    <button class="detail-action-btn" id="summaryViewFullBtn" title="View full transcript">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"></path>
+                            <polyline points="14 2 14 8 20 8"></polyline>
+                            <line x1="16" y1="13" x2="8" y2="13"></line>
+                            <line x1="16" y1="17" x2="8" y2="17"></line>
+                            <polyline points="10 9 9 9 8 9"></polyline>
+                        </svg>
+                        <span>Full Transcript</span>
+                    </button>
+                </div>
+            </div>
+
+            ${audioHtml}
+
+            <div class="summary-card summary-executive">
+                <h2 class="summary-section-title">EXECUTIVE SUMMARY</h2>
+                <p class="summary-text">${meetingNotes.summary ? escapeHtml(meetingNotes.summary) : escapeHtml(transcription.briefing)}</p>
+            </div>
+
+            <div class="summary-grid">
+                <div class="summary-card">
+                    <h2 class="summary-section-title">DISCUSSION POINTS</h2>
+                    ${listHtml(meetingNotes.discussion_points)}
+                </div>
+
+                <div class="summary-card summary-action-items-card">
+                    <h2 class="summary-section-title">ACTION ITEMS</h2>
+                    <div class="summary-action-items">
+                        ${actionItemsHtml || '<p class="summary-empty-text">None recorded.</p>'}
+                    </div>
+                </div>
+
+                <div class="summary-card">
+                    <h2 class="summary-section-title">DECISIONS</h2>
+                    ${listHtml(meetingNotes.decisions)}
+                </div>
+
+                <div class="summary-card">
+                    <h2 class="summary-section-title">NEXT STEPS</h2>
+                    ${listHtml(meetingNotes.next_steps)}
+                </div>
+            </div>
+        </div>
+    `;
+
+    // Event listeners
+    setupMeetingSummaryListeners(transcription);
+
+    // Load audio if available
+    if (transcription.hasAudio) {
+        loadSummaryAudio(transcription.id);
+    }
+}
+
+function setupMeetingSummaryListeners(transcription) {
+    const backBtn = document.getElementById('summaryBackBtn');
+    if (backBtn) {
+        backBtn.addEventListener('click', () => {
+            if (summaryReturnView === 'detail') {
+                showTranscriptionDetail(transcription);
+            } else {
+                switchView(activeView === 'library' ? 'library' : 'home');
+            }
+        });
+    }
+
+    const copyMarkdownBtn = document.getElementById('summaryCopyMarkdownBtn');
+    if (copyMarkdownBtn) {
+        copyMarkdownBtn.addEventListener('click', () => copyMeetingMarkdown(transcription.id));
+    }
+
+    const shareEmailBtn = document.getElementById('summaryShareEmailBtn');
+    if (shareEmailBtn) {
+        shareEmailBtn.addEventListener('click', () => shareMeetingByEmail(transcription.id));
+    }
+
+    const shareNotionBtn = document.getElementById('summaryShareNotionBtn');
+    if (shareNotionBtn) {
+        shareNotionBtn.addEventListener('click', () => shareMeetingToNotion(transcription.id));
+    }
+
+    const viewFullBtn = document.getElementById('summaryViewFullBtn');
+    if (viewFullBtn) {
+        viewFullBtn.addEventListener('click', () => showTranscriptionDetail(transcription, 'summary'));
+    }
+
+    // Action item checkboxes
+    const checkboxes = meetingSummaryView.querySelectorAll('.summary-action-checkbox');
+    checkboxes.forEach(checkbox => {
+        checkbox.addEventListener('change', () => {
+            const label = checkbox.closest('.summary-action-item');
+            if (label) label.classList.toggle('done', checkbox.checked);
+            persistActionItemState(transcription.id);
+        });
+    });
+}
+
+function persistActionItemState(jobId) {
+    const checkboxes = meetingSummaryView.querySelectorAll('.summary-action-checkbox');
+    const completedItems = [];
+    checkboxes.forEach(cb => {
+        if (cb.checked) completedItems.push(parseInt(cb.dataset.index, 10));
+    });
+
+    // Update in-memory transcription
+    if (selectedTranscription && selectedTranscription.meetingNotes) {
+        selectedTranscription.meetingNotes._completedItems = completedItems;
+    }
+
+    // Persist to backend
+    api.updateActionItems(jobId, completedItems).catch(err => {
+        console.warn('Failed to persist action items:', err);
+    });
+}
+
+async function loadSummaryAudio(jobId) {
+    const audioEl = document.getElementById('summaryAudioPlayer');
+    const audioContainer = document.getElementById('summaryAudioContainer');
+    if (!audioEl) return;
+
+    const requestId = ++summaryAudioRequestId;
+    if (audioContainer) audioContainer.classList.add('loading');
+
+    try {
+        const payload = await api.getJobAudio(jobId);
+        if (requestId !== summaryAudioRequestId) return;
+        if (!payload || !payload.data) {
+            if (audioContainer) audioContainer.style.display = 'none';
+            return;
+        }
+        const mimeType = payload.mimeType || 'application/octet-stream';
+        const blob = new Blob([payload.data], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        summaryAudioUrl = url;
+        audioEl.src = url;
+    } catch (e) {
+        if (requestId !== summaryAudioRequestId) return;
+        console.warn('Failed to load summary audio:', e);
+        if (audioContainer) audioContainer.style.display = 'none';
+    } finally {
+        if (audioContainer && requestId === summaryAudioRequestId) {
+            audioContainer.classList.remove('loading');
+        }
+    }
 }
 
 // ============================================
@@ -2483,6 +2804,22 @@ function cleanupDetailAudio() {
     }
 }
 
+function cleanupSummaryAudio() {
+    summaryAudioRequestId += 1;
+    if (summaryAudioUrl) {
+        URL.revokeObjectURL(summaryAudioUrl);
+        summaryAudioUrl = null;
+    }
+    const audioEl = document.getElementById('summaryAudioPlayer');
+    if (audioEl) {
+        if (typeof audioEl.pause === 'function') {
+            audioEl.pause();
+        }
+        audioEl.removeAttribute('src');
+        audioEl.load();
+    }
+}
+
 async function loadDetailAudio(jobId) {
     const audioEl = document.getElementById('detailAudioPlayer');
     const audioContainer = document.getElementById('detailAudioContainer');
@@ -2531,6 +2868,9 @@ function renderTranscriptionCard(transcription, horizontal = false, delay = 0) {
     const meetingClass = isMeeting ? ' meeting-card' : '';
     const processingBadge = isReprocessing ? '<span class="transcription-card-badge">Re-transcribing...</span>' : '';
     const meetingBadge = isMeeting ? '<span class="meeting-badge">Meeting</span>' : '';
+    const summaryBtn = isMeeting
+        ? `<button class="card-summary-btn" data-summary-id="${transcription.id}" title="View meeting summary">Summary</button>`
+        : '';
     const speakersHtml = transcription.speakers.slice(0, 3).map((s, i) => {
         const colorClass = i === 0 ? 'gray' : i === 1 ? 'light' : 'stone';
         const initial = escapeHtml(s.name.charAt(0));
@@ -2549,6 +2889,7 @@ function renderTranscriptionCard(transcription, horizontal = false, delay = 0) {
                     <p class="transcription-card-briefing">${briefing}</p>
                     <div class="transcription-card-meta">
                         <span class="transcription-card-date">${escapeHtml(transcription.date)}</span>
+                        ${summaryBtn}
                         <div class="speaker-avatars">
                             ${speakersHtml}
                             ${moreCount > 0 ? `<span class="speaker-more">+${moreCount}</span>` : ''}
@@ -2574,6 +2915,7 @@ function renderTranscriptionCard(transcription, horizontal = false, delay = 0) {
             <p class="transcription-card-briefing">${briefing}</p>
             <div class="transcription-card-meta">
                 <span class="transcription-card-date">${escapeHtml(transcription.date)}</span>
+                ${summaryBtn}
                 <div class="speaker-avatars">
                     ${speakersHtml}
                     ${moreCount > 0 ? `<span class="speaker-more">+${moreCount}</span>` : ''}
@@ -2581,6 +2923,17 @@ function renderTranscriptionCard(transcription, horizontal = false, delay = 0) {
             </div>
         </div>
     `;
+}
+
+function attachSummaryButtonHandlers(container) {
+    container.querySelectorAll('.card-summary-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const id = btn.dataset.summaryId;
+            const transcription = transcriptions.find(t => t.id == id);
+            if (transcription) showMeetingSummary(transcription);
+        });
+    });
 }
 
 function renderRecentTranscriptions() {
@@ -2600,6 +2953,7 @@ function renderRecentTranscriptions() {
             if (transcription) showTranscriptionDetail(transcription);
         });
     });
+    attachSummaryButtonHandlers(recentTranscriptions);
 
     renderUsageStats();
 }
@@ -2628,6 +2982,7 @@ function renderLibrary() {
             if (transcription) showTranscriptionDetail(transcription);
         });
     });
+    attachSummaryButtonHandlers(libraryList);
 }
 
 function setupLibraryFilters() {
@@ -2646,7 +3001,8 @@ function renderJobItem(job, compact = false, delay = 0) {
     const isComplete = job.status === 'completed' || job.status === 'complete';
     const isFailed = job.status === 'failed';
     const isDiarizing = isComplete && (job.diarization_status === 'pending' || job.diarization_status === 'processing');
-    const isProcessing = !isComplete && !isFailed;
+    const isRetranscribing = !!job.isRetranscribe && !isComplete && !isFailed;
+    const isProcessing = !isComplete && !isFailed && !isRetranscribing;
 
     let iconClass = '';
     let icon = '';
@@ -2669,6 +3025,11 @@ function renderJobItem(job, compact = false, delay = 0) {
             ? '<span class="job-badge failed">Retry</span>'
             : '<span class="job-badge failed">Failed</span>';
         statusText = job.audio_path ? 'Click to retry' : 'Failed';
+    } else if (isRetranscribing) {
+        iconClass = 'retranscribing';
+        icon = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg>`;
+        badge = '<span class="job-badge">Re-transcribing</span>';
+        statusText = 'Re-transcribing';
     } else {
         icon = `<svg class="spinner" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>`;
         statusText = `${job.progress || 0}%`;
@@ -2676,9 +3037,10 @@ function renderJobItem(job, compact = false, delay = 0) {
 
     const jobName = escapeHtml(job.name || job.title || 'Untitled');
     const delayStyle = delay > 0 ? `animation-delay: ${delay}s;` : '';
+    const dimClass = isRetranscribing ? ' is-processing' : '';
 
     return `
-        <div class="job-item animate-float-up ${compact ? 'compact' : ''}" data-id="${job.id}" style="${delayStyle}">
+        <div class="job-item animate-float-up ${compact ? 'compact' : ''}${dimClass}" data-id="${job.id}" style="${delayStyle}">
             <div class="job-icon ${iconClass}">${icon}</div>
             <div class="job-content">
                 <div class="job-header">
@@ -2729,10 +3091,21 @@ function renderDetailView(transcription) {
     if (!detailView) return;
 
     cleanupDetailAudio();
-    const isMeetingTranscription = !!transcription.meetingNotes;
+    const isMeetingTranscription = !!transcription.isMeeting || !!transcription.meetingNotes;
     const meetingShareTemplate = document.getElementById('meetingShareActionsTemplate');
     const meetingShareActionsHtml = isMeetingTranscription
         ? (meetingShareTemplate ? meetingShareTemplate.innerHTML : '')
+        : '';
+    const viewSummaryBtnHtml = isMeetingTranscription
+        ? `<button class="detail-action-btn" id="detailViewSummaryBtn" title="View meeting summary">
+               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                   <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                   <line x1="7" y1="8" x2="17" y2="8"></line>
+                   <line x1="7" y1="12" x2="17" y2="12"></line>
+                   <line x1="7" y1="16" x2="13" y2="16"></line>
+               </svg>
+               <span>Summary</span>
+           </button>`
         : '';
 
     const speakersHtml = transcription.speakers.map((speaker, i) => {
@@ -2902,6 +3275,7 @@ function renderDetailView(transcription) {
                         </svg>
                         <span>Copy</span>
                     </button>
+                    ${viewSummaryBtnHtml}
                     ${meetingShareActionsHtml}
                     <button class="detail-action-btn" id="detailDownloadBtn" title="Download">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -2969,7 +3343,19 @@ function setupDetailViewListeners() {
     const backBtn = document.getElementById('detailBackBtn');
     if (backBtn) {
         backBtn.addEventListener('click', () => {
-            switchView(activeView === 'library' ? 'library' : 'home');
+            if (detailReturnView === 'summary' && selectedTranscription) {
+                showMeetingSummary(selectedTranscription);
+            } else {
+                switchView(activeView === 'library' ? 'library' : 'home');
+            }
+        });
+    }
+
+    // View Summary button (for meetings)
+    const viewSummaryBtn = document.getElementById('detailViewSummaryBtn');
+    if (viewSummaryBtn && selectedTranscription) {
+        viewSummaryBtn.addEventListener('click', () => {
+            showMeetingSummary(selectedTranscription, 'detail');
         });
     }
 
@@ -3150,15 +3536,23 @@ async function loadJobs() {
     if (!jobsList) return;
     try {
         const data = await api.listJobs();
-        jobs = data.map(job => ({
-            id: job.id,
-            name: job.title || 'Untitled',
-            status: job.status,
-            diarization_status: job.diarization_status || null,
-            progress: job.status === 'completed' ? 100 : 50,
-            created_at: job.created_at,
-            audio_path: job.audio_path || null
-        }));
+        const prevJobs = jobs;
+        jobs = data.map(job => {
+            const prev = prevJobs.find(j => j.id === job.id);
+            const isRetranscription = !!job.is_retranscription || prev?.isRetranscribe;
+            return {
+                id: job.id,
+                name: job.title || 'Untitled',
+                status: job.status,
+                diarization_status: job.diarization_status || null,
+                progress: job.status === 'completed' ? 100 : 50,
+                created_at: job.created_at,
+                audio_path: job.audio_path || null,
+                is_meeting: job.is_meeting || undefined,
+                isRetranscribe: isRetranscription && job.status !== 'completed' && job.status !== 'failed'
+                    ? true : undefined
+            };
+        });
         renderJobsList();
         updateProcessingSection();
 
@@ -3189,6 +3583,28 @@ async function loadJobs() {
                 console.warn('Failed to load job detail:', e);
             }
         }
+
+        // Ensure retranscribing jobs remain visible in the library
+        for (const job of data.filter(j => (j.status === 'pending' || j.status === 'processing') && !!j.is_retranscription)) {
+            const exists = transcriptions.some(t => t.id === job.id);
+            if (!exists) {
+                transcriptions.push({
+                    id: job.id,
+                    title: job.title || 'Re-transcribing...',
+                    date: job.created_at ? new Date(job.created_at).toISOString().split('T')[0] : new Date().toISOString().split('T')[0],
+                    duration: job.duration || '0:00',
+                    status: 'complete',
+                    speakers: [],
+                    segments: [],
+                    briefing: '',
+                    hasAudio: true,
+                    isMeeting: job.is_meeting || false,
+                    meetingNotes: null,
+                    diarizationStatus: null
+                });
+            }
+        }
+
         renderRecentTranscriptions();
         renderLibrary();
     } catch (e) {

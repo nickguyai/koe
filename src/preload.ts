@@ -136,6 +136,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   shareMeetingToNotion: (payload: { jobId: string }) => {
     return ipcRenderer.invoke('transcription-job-share-notion', payload);
   },
+  updateActionItems: (payload: { jobId: string; completedItems: number[] }) => {
+    return ipcRenderer.invoke('transcription-job-update-action-items', payload);
+  },
+  generateMeetingNotes: (jobId: string) => {
+    return ipcRenderer.invoke('generate-meeting-notes', jobId);
+  },
 
   // OpenAI realtime
   openAIRealtimeStart: (options?: { meetingMode?: boolean }) => {
@@ -205,6 +211,8 @@ declare global {
       deleteTranscriptionJob: (jobId: string) => Promise<{ deleted: boolean }>;
       exportTranscriptionJob: (jobId: string) => Promise<{ title: string; markdown: string; filename: string }>;
       shareMeetingToNotion: (payload: { jobId: string }) => Promise<{ ok: boolean; toolName?: string; pageId?: string; pageUrl?: string; message?: string }>;
+      updateActionItems: (payload: { jobId: string; completedItems: number[] }) => Promise<{ completedItems: number[]; updated_at: string }>;
+      generateMeetingNotes: (jobId: string) => Promise<{ meeting_notes: Record<string, unknown>; updated_at: string } | null>;
       openAIRealtimeStart: (options?: { meetingMode?: boolean }) => Promise<boolean>;
       openAIRealtimeStop: (options?: { meetingMode?: boolean }) => Promise<boolean | { transcript?: string }>;
       openAIRealtimeDisconnect: () => Promise<boolean>;

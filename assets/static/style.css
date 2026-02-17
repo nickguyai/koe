@@ -613,6 +613,11 @@ body.is-recording .recording-hint {
     padding: 16px;
 }
 
+.job-item.is-processing {
+    opacity: 0.55;
+    filter: grayscale(0.2);
+}
+
 .job-icon {
     width: 40px;
     height: 40px;
@@ -2441,4 +2446,238 @@ body.meeting-mode .recording-time.active {
 
 .meeting-summary-cta:hover {
     background: #5a6a4e;
+}
+
+/* ============================================
+   Meeting Summary Page
+   ============================================ */
+.summary-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    margin-bottom: 32px;
+}
+
+.summary-header-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.summary-title {
+    font-size: 2rem;
+    font-weight: 300;
+    color: var(--sumi-black);
+    margin-bottom: 8px;
+}
+
+.summary-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    color: var(--diluted-ink);
+}
+
+.summary-meta .meeting-badge {
+    margin-left: 4px;
+}
+
+.summary-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+.summary-audio {
+    margin-bottom: 24px;
+}
+
+.summary-audio audio {
+    width: 100%;
+    border-radius: 4px 12px 4px 12px;
+}
+
+.summary-audio.loading {
+    opacity: 0.5;
+}
+
+/* Executive summary card - full width */
+.summary-card {
+    background: linear-gradient(165deg, var(--washi-white) 0%, var(--aged-paper) 100%);
+    border-radius: 4px 20px 4px 20px;
+    padding: 28px 32px;
+    margin-bottom: 20px;
+}
+
+.summary-card.summary-executive {
+    border-left: 3px solid var(--moss-stone);
+    margin-bottom: 28px;
+}
+
+.summary-section-title {
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--diluted-ink);
+    margin-bottom: 16px;
+    font-weight: 500;
+}
+
+.summary-text {
+    font-size: 1.125rem;
+    line-height: 1.8;
+    color: var(--brushed-gray);
+}
+
+/* Summary grid: 2-column layout for sections */
+.summary-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+}
+
+@media (max-width: 700px) {
+    .summary-header {
+        flex-direction: column;
+    }
+    .summary-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* List items in summary sections */
+.summary-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.summary-list-item {
+    position: relative;
+    padding-left: 18px;
+    color: var(--brushed-gray);
+    line-height: 1.6;
+}
+
+.summary-list-item::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 9px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--sumi-black);
+}
+
+.summary-empty-text {
+    color: var(--diluted-ink);
+    font-style: italic;
+}
+
+/* Action items with checkboxes */
+.summary-action-items {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.summary-action-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    cursor: pointer;
+    padding: 8px 12px;
+    border-radius: 2px 8px 2px 8px;
+    transition: background 0.2s ease;
+}
+
+.summary-action-item:hover {
+    background: rgba(28, 28, 28, 0.03);
+}
+
+.summary-action-checkbox {
+    margin-top: 3px;
+    flex-shrink: 0;
+    accent-color: var(--moss-stone);
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+}
+
+.summary-action-text {
+    color: var(--brushed-gray);
+    line-height: 1.5;
+    transition: opacity 0.2s ease;
+}
+
+.summary-action-item.done .summary-action-text {
+    text-decoration: line-through;
+    opacity: 0.5;
+}
+
+.summary-empty {
+    text-align: center;
+    padding: 60px 0;
+    color: var(--diluted-ink);
+}
+
+/* View Summary button on cards */
+.card-summary-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    color: var(--moss-stone);
+    background: rgba(107, 123, 94, 0.08);
+    border: none;
+    border-radius: 2px 8px 2px 8px;
+    cursor: pointer;
+    transition: background 0.2s ease;
+    margin-left: 8px;
+}
+
+.card-summary-btn:hover {
+    background: rgba(107, 123, 94, 0.16);
+}
+
+/* Print-friendly styles */
+@media print {
+    .nav-bar,
+    .summary-actions,
+    .detail-back-btn,
+    .summary-audio,
+    .summary-back-btn,
+    .card-summary-btn {
+        display: none !important;
+    }
+
+    .meeting-summary {
+        background: white;
+        padding: 0;
+    }
+
+    .summary-card {
+        break-inside: avoid;
+        box-shadow: none;
+        border: 1px solid #ddd;
+    }
+
+    .summary-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .summary-section {
+        break-inside: avoid;
+    }
+
+    .summary-action-item.done .summary-action-text {
+        text-decoration: line-through;
+    }
 }
