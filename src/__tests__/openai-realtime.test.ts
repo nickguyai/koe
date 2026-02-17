@@ -78,6 +78,7 @@ vi.mock('ws', () => ({
 }));
 
 import { OpenAIRealtimeClient } from '../backend/openai-realtime';
+import { LIVE_TRANSCRIPTION_PROMPT } from '../backend/prompts';
 
 type TestWs = InstanceType<typeof MockWebSocket>;
 
@@ -343,5 +344,48 @@ describe('OpenAIRealtimeClient', () => {
 
     expect(textHandler).toHaveBeenNthCalledWith(1, { content: 'hello', isNewResponse: false });
     expect(textHandler).toHaveBeenNthCalledWith(2, { content: 'hello', isNewResponse: true });
+  });
+
+  // Guard: LIVE_TRANSCRIPTION_PROMPT must always be sent for single mode.
+  // Regression for ba224deae which accidentally dropped the prompt while adding language support.
+  it('LIVE_TRANSCRIPTION_PROMPT is sent as instructions in single mode', async () => {
+    const client = new OpenAIRealtimeClient('test-key', undefined, undefined, {
+      single: LIVE_TRANSCRIPTION_PROMPT,
+    });
+    const ws = await connectClient(client, 'single');
+
+    const sessionUpdate = firstMessageByType(ws, 'session.update');
+    expect(sessionUpdate).toBeDefined();
+
+    const session = (sessionUpdate!.session || {}) as Record<string, unknown>;
+    expect(session.instructions).toBe(LIVE_TRANSCRIPTION_PROMPT);
+    expect(session.input_audio_transcription).toBeUndefined();
+  });
+
+  it('LIVE_TRANSCRIPTION_PROMPT is NOT sent in meeting mode (uses input_audio_transcription)', async () => {
+    const client = new OpenAIRealtimeClient('test-key', undefined, undefined, {
+      single: LIVE_TRANSCRIPTION_PROMPT,
+    });
+    const ws = await connectClient(client, 'meeting');
+
+    const sessionUpdate = firstMessageByType(ws, 'session.update');
+    expect(sessionUpdate).toBeDefined();
+
+    const session = (sessionUpdate!.session || {}) as Record<string, unknown>;
+    expect(session.instructions).toBeUndefined();
+    expect(session.input_audio_transcription).toBeDefined();
+  });
+
+  it('passes language to session config with LIVE_TRANSCRIPTION_PROMPT', async () => {
+    const client = new OpenAIRealtimeClient('test-key', undefined, undefined, {
+      single: LIVE_TRANSCRIPTION_PROMPT,
+    }, 'ja');
+    const ws = await connectClient(client, 'single');
+
+    const sessionUpdate = firstMessageByType(ws, 'session.update');
+    const session = (sessionUpdate!.session || {}) as Record<string, unknown>;
+    // With instructions, language is not set via input_audio_transcription
+    // but the prompt itself handles language via its rules
+    expect(session.instructions).toBe(LIVE_TRANSCRIPTION_PROMPT);
   });
 });

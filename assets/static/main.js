@@ -1537,6 +1537,12 @@ async function stopRecording() {
             }
         }
 
+        // Disconnect liveSource before flushing to prevent post-flush audio loss
+        if (liveSource) {
+            liveSource.disconnect();
+            liveSource = null;
+        }
+
         // Flush residual audio from the worklet buffer before committing
         if (liveAudioWorklet) {
             const originalHandler = liveAudioWorklet.port.onmessage;
@@ -1562,7 +1568,7 @@ async function stopRecording() {
         }
 
         // Brief pause to let in-flight IPC audio chunks arrive at the backend
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await new Promise((resolve) => setTimeout(resolve, 350));
 
         let stopResult = null;
         if (window.electronAPI && window.electronAPI.openAIRealtimeStop) {

@@ -175,6 +175,20 @@ export class OpenAIRealtimeClient extends EventEmitter {
       return;
     }
     await this.sendQueue;
+
+    // Send ~300ms of trailing silence (PCM16 zeros) before committing.
+    // At 24kHz mono PCM16, 300ms = 7200 samples = 14400 bytes.
+    // This prevents OpenAI from truncating the final word/syllable when
+    // turn_detection is null (single mode) and audio ends abruptly.
+    const silenceBytes = 14400;
+    const silence = Buffer.alloc(silenceBytes, 0);
+    await this.enqueueSend(
+      JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: silence.toString('base64'),
+      }),
+    );
+
     this.emitStatus('processing');
     this.commitAudioAt = Date.now();
     await this.enqueueSend(JSON.stringify({ type: 'input_audio_buffer.commit' }));

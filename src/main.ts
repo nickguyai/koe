@@ -13,7 +13,7 @@ import { SynthesisProcessor } from './backend/synthesis-processor';
 import { ConsensusTranscriber } from './backend/consensus-transcriber';
 import { MeetingNotesGenerator } from './backend/meeting-notes-generator';
 import { NotionMcpService } from './backend/notion-mcp-service';
-
+import { LIVE_TRANSCRIPTION_PROMPT } from './backend/prompts';
 import { getSystemAudioService } from './system-audio-service';
 import { mixPcmBuffers } from './audio-mixer';
 import { getPermissionService } from './permission-service';
@@ -502,8 +502,15 @@ function registerBackendIpcHandlers(): void {
     }
     await stopSystemAudioCapture();
 
-    const language = configManager!.getSettings().language || 'en';
-    openAIClient = new OpenAIRealtimeClient(apiKey, undefined, undefined, undefined, language);
+    const settings = configManager!.getSettings();
+    const language = settings.language || 'en';
+    const customPrompt = (settings.customTranscriptionPrompt || '').trim();
+    // Single/live mode: instructions guide formatting + anti-conversation guardrails.
+    // Meeting mode: no instructions → uses input_audio_transcription (gpt-4o-transcribe)
+    // for pure transcription without conversational meta-responses.
+    openAIClient = new OpenAIRealtimeClient(apiKey, undefined, undefined, {
+      single: customPrompt || LIVE_TRANSCRIPTION_PROMPT,
+    }, language);
     openAIClient.on('status', (status: string) => {
       sendRealtimeEvent({ type: 'status', status });
     });

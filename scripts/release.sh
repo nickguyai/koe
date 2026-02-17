@@ -11,6 +11,12 @@ echo "🚀 Building $APP_NAME..."
 
 cd "$ELECTRON_DIR"
 
+# Bump patch version (e.g. 1.0.5 → 1.0.6)
+OLD_VERSION=$(node -p "require('./package.json').version")
+npm version patch --no-git-tag-version > /dev/null
+NEW_VERSION=$(node -p "require('./package.json').version")
+echo "📦 Version bump: $OLD_VERSION → $NEW_VERSION"
+
 # Clean previous builds
 echo "🧹 Cleaning previous builds..."
 rm -rf dist/
