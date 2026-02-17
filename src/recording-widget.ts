@@ -83,7 +83,12 @@ export class RecordingWidget {
     // macOS: highest z-level + visible on fullscreen spaces
     if (process.platform === 'darwin') {
       win.setAlwaysOnTop(true, 'screen-saver');
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      const setVisibleOnAllWorkspaces = (
+        win as unknown as {
+          setVisibleOnAllWorkspaces?: (visible: boolean, options?: { visibleOnFullScreen?: boolean }) => void;
+        }
+      ).setVisibleOnAllWorkspaces;
+      setVisibleOnAllWorkspaces?.call(win, true, { visibleOnFullScreen: true });
     }
 
     // file:// protocol renders reliably on all displays under hardened runtime
@@ -102,7 +107,7 @@ export class RecordingWidget {
       show();
       // Push current state so late-added displays reflect the active state
       if (this.currentState !== 'idle' && !win.isDestroyed()) {
-        win.webContents.send('widget-state-update', { status: this.currentState });
+        win.webContents.send('widget-state-update', { status: this.currentState, mode: this._meetingMode ? 'meeting' : 'dictation' });
       }
     });
 
@@ -138,6 +143,12 @@ export class RecordingWidget {
   /**
    * Push state to all widget windows
    */
+  private _meetingMode: boolean = false;
+
+  setMeetingMode(enabled: boolean): void {
+    this._meetingMode = Boolean(enabled);
+  }
+
   updateAllWidgets(state: WidgetState): void {
     this.currentState = state;
     for (const [id, win] of this.widgets) {
@@ -145,7 +156,7 @@ export class RecordingWidget {
         this.widgets.delete(id);
         continue;
       }
-      win.webContents.send('widget-state-update', { status: state });
+      win.webContents.send('widget-state-update', { status: state, mode: this._meetingMode ? 'meeting' : 'dictation' });
     }
   }
 

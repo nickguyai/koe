@@ -5,6 +5,7 @@ import { getTextInsertionService } from './text-insertion-service';
 import { getRecordingWidget } from './recording-widget';
 import { getPermissionService } from './permission-service';
 import { getConfigService } from './config-service';
+import { getSystemAudioService, MeetingAppDetectedEvent } from './system-audio-service';
 
 /**
  * Orchestrator connects all services together and manages the recording flow
@@ -12,10 +13,23 @@ import { getConfigService } from './config-service';
 export class Orchestrator {
   private mainWindow: BrowserWindow | null = null;
   private isRecording: boolean = false;
+  private isMeetingModeEnabled: boolean = false;
   private rendererPath: string | null = null;
   private processingTimeout: NodeJS.Timeout | null = null;
   private feedbackTimeout: NodeJS.Timeout | null = null;
   private readonly PROCESSING_TIMEOUT_MS = 30000; // 30 seconds
+  private readonly MEETING_PROMPT_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
+  private readonly meetingPromptTimestamps = new Map<string, number>();
+  private readonly meetingProcessNames = [
+    'zoom.us',
+    'zoom',
+    'Google Chrome',
+    'Google Meet',
+    'Microsoft Teams',
+    'teams',
+  ];
+  private meetingDetectionListener: ((event: MeetingAppDetectedEvent) => void) | null = null;
+  private meetingDetectionMonitorOperation: Promise<void> = Promise.resolve();
 
   constructor() {
     this.setupStateMachineListeners();
@@ -105,6 +119,8 @@ export class Orchestrator {
     if (!registered) {
       console.error('Failed to register global hotkey');
     }
+
+    await this.setMeetingDetectionMonitorEnabled(true);
   }
 
   /**
@@ -118,6 +134,7 @@ export class Orchestrator {
     widget.destroy();
 
     this.clearProcessingTimeout();
+    void this.setMeetingDetectionMonitorEnabled(false);
   }
 
   /**
@@ -144,8 +161,15 @@ export class Orchestrator {
     stateMachine.on('stateChange', (state: RecordingState, previousState: RecordingState) => {
       console.log(`Orchestrator: State changed from ${previousState} to ${state}`);
 
+      void this.setMeetingDetectionMonitorEnabled(state === 'idle');
+
       switch (state) {
         case 'recording':
+          widget.updateAllWidgets('recording');
+          this.startRecordingInRenderer();
+          break;
+
+        case 'meeting_recording':
           widget.updateAllWidgets('recording');
           this.startRecordingInRenderer();
           break;
@@ -169,6 +193,24 @@ export class Orchestrator {
           }, this.PROCESSING_TIMEOUT_MS);
           break;
 
+        case 'meeting_processing':
+          widget.updateAllWidgets('processing');
+          this.stopRecordingInRenderer();
+          this.clearProcessingTimeout();
+          this.processingTimeout = setTimeout(() => {
+            if (stateMachine.currentState === 'meeting_processing') {
+              console.error('Meeting processing timeout - transcription/notes took too long');
+              widget.updateAllWidgets('error');
+              this.feedbackTimeout = setTimeout(() => {
+                if (stateMachine.currentState === 'meeting_processing') {
+                  widget.updateAllWidgets('idle');
+                  stateMachine.transition('error');
+                }
+              }, 3000);
+            }
+          }, this.PROCESSING_TIMEOUT_MS);
+          break;
+
         case 'inserting':
           this.clearProcessingTimeout();
           // Handled by transcription complete callback
@@ -183,7 +225,7 @@ export class Orchestrator {
           // Skip widget update when coming from inserting or processing —
           // handled by the success/error feedback timeout in the
           // transcription-complete and transcription-error handlers
-          if (previousState !== 'inserting' && previousState !== 'processing') {
+          if (previousState !== 'inserting' && previousState !== 'processing' && previousState !== 'meeting_processing') {
             widget.updateAllWidgets('idle');
           }
           break;
@@ -209,20 +251,26 @@ export class Orchestrator {
       console.log('Orchestrator: Hotkey pressed');
 
       if (stateMachine.currentState === 'idle') {
-        // Capture the active app BEFORE recording starts
-        // This is critical for pasting back to the right app
-        await textInsertionService.captureActiveApp();
+        if (!this.isMeetingModeEnabled) {
+          // Capture the active app BEFORE recording starts.
+          // Needed for paste-back in regular dictation mode.
+          await textInsertionService.captureActiveApp();
+        }
 
         stateMachine.transition('hotkey_press');
         this.isRecording = true;
       } else if (stateMachine.currentState === 'recording') {
-        // Toggle mode: if already recording, stop
-        stateMachine.transition('hotkey_release');
+        stateMachine.transition('hotkey_press');
+        this.isRecording = false;
+      } else if (stateMachine.currentState === 'meeting_recording') {
+        stateMachine.transition('hotkey_press');
         this.isRecording = false;
       } else if (stateMachine.currentState === 'error') {
         console.warn('Orchestrator: Hotkey pressed during error state, resetting');
         stateMachine.reset();
-        await textInsertionService.captureActiveApp();
+        if (!this.isMeetingModeEnabled) {
+          await textInsertionService.captureActiveApp();
+        }
         stateMachine.transition('hotkey_press');
         this.isRecording = true;
       } else {
@@ -247,11 +295,13 @@ export class Orchestrator {
       console.log('Orchestrator: Widget toggle recording');
 
       if (stateMachine.currentState === 'idle') {
-        await textInsertionService.captureActiveApp();
+        if (!this.isMeetingModeEnabled) {
+          await textInsertionService.captureActiveApp();
+        }
         stateMachine.transition('hotkey_press');
         this.isRecording = true;
-      } else if (stateMachine.currentState === 'recording') {
-        stateMachine.transition('hotkey_release');
+      } else if (stateMachine.currentState === 'recording' || stateMachine.currentState === 'meeting_recording') {
+        stateMachine.transition('hotkey_press');
         this.isRecording = false;
       } else {
         console.log(`Orchestrator: Widget click ignored in state ${stateMachine.currentState}`);
@@ -292,6 +342,16 @@ export class Orchestrator {
             stateMachine.transition('insertion_complete');
           }
         }, 2000);
+      } else if (stateMachine.currentState === 'meeting_processing') {
+        const widget = getRecordingWidget();
+        widget.updateAllWidgets('success');
+
+        this.feedbackTimeout = setTimeout(() => {
+          if (stateMachine.currentState === 'meeting_processing') {
+            widget.updateAllWidgets('idle');
+            stateMachine.transition('notes_complete');
+          }
+        }, 1500);
       }
     });
 
@@ -304,7 +364,7 @@ export class Orchestrator {
 
       // Show error feedback for 3s, then transition to idle
       this.feedbackTimeout = setTimeout(() => {
-        if (stateMachine.currentState === 'processing') {
+        if (stateMachine.currentState === 'processing' || stateMachine.currentState === 'meeting_processing') {
           widget.updateAllWidgets('idle');
           stateMachine.transition('error');
         }
@@ -341,6 +401,57 @@ export class Orchestrator {
       const configService = getConfigService();
       return configService.getHotkey();
     });
+
+    ipcMain.handle('set-meeting-mode', async (_event, enabled: boolean) => {
+      this.isMeetingModeEnabled = Boolean(enabled);
+      stateMachine.setMeetingMode(this.isMeetingModeEnabled);
+      const widget = getRecordingWidget();
+      widget.setMeetingMode(this.isMeetingModeEnabled);
+      if (this.isMeetingModeEnabled) {
+        configService.setMeetingDetectionEnabled(true);
+        await this.setMeetingDetectionMonitorEnabled(false);
+      } else {
+        await this.setMeetingDetectionMonitorEnabled(true);
+      }
+      return this.isMeetingModeEnabled;
+    });
+
+    ipcMain.handle('get-meeting-mode', () => {
+      return this.isMeetingModeEnabled;
+    });
+
+    ipcMain.handle(
+      'meeting-mode-suggestion-dismiss',
+      async (_event, payload: { appName?: string; dontAskAgain?: boolean }) => {
+        const appName = String(payload?.appName || '').trim();
+        const dontAskAgain = Boolean(payload?.dontAskAgain);
+        if (appName && dontAskAgain) {
+          configService.setMeetingPromptDismissedForApp(appName, true);
+        }
+        return true;
+      },
+    );
+
+    ipcMain.handle(
+      'meeting-mode-suggestion-switch',
+      async (_event, payload: { appName?: string; dontAskAgain?: boolean }) => {
+        const appName = String(payload?.appName || '').trim();
+        const dontAskAgain = Boolean(payload?.dontAskAgain);
+        if (appName && dontAskAgain) {
+          configService.setMeetingPromptDismissedForApp(appName, true);
+        }
+
+        this.isMeetingModeEnabled = true;
+        stateMachine.setMeetingMode(true);
+        const widget = getRecordingWidget();
+        widget.setMeetingMode(true);
+        configService.setMeetingDetectionEnabled(true);
+        await this.setMeetingDetectionMonitorEnabled(false);
+        this.sendRendererEvent('meeting-mode-updated', { enabled: true, source: 'meeting-detection' });
+
+        return this.isMeetingModeEnabled;
+      },
+    );
   }
 
   /**
@@ -410,6 +521,137 @@ export class Orchestrator {
     } catch (err) {
       console.error('Error sending reset-recording-state:', err);
     }
+  }
+
+  private async setMeetingDetectionMonitorEnabled(enabled: boolean): Promise<void> {
+    this.meetingDetectionMonitorOperation = this.meetingDetectionMonitorOperation
+      .then(async () => {
+        if (enabled) {
+          await this.startMeetingDetectionMonitor();
+        } else {
+          await this.stopMeetingDetectionMonitor();
+        }
+      })
+      .catch((err) => {
+        console.warn('Meeting detection monitor operation failed:', err);
+      });
+
+    return this.meetingDetectionMonitorOperation;
+  }
+
+  private async startMeetingDetectionMonitor(): Promise<void> {
+    if (this.isMeetingModeEnabled || this.isRecording) {
+      return;
+    }
+
+    const configService = getConfigService();
+    if (!configService.getMeetingDetectionEnabled()) {
+      return;
+    }
+
+    const service = getSystemAudioService();
+
+    if (!this.meetingDetectionListener) {
+      this.meetingDetectionListener = (event: MeetingAppDetectedEvent) => {
+        this.handleMeetingAppDetected(event);
+      };
+      service.on('meeting-app-detected', this.meetingDetectionListener);
+    }
+
+    if (service.currentStatus === 'recording') {
+      return;
+    }
+    if (service.currentStatus === 'unsupported') {
+      return;
+    }
+
+    try {
+      const permissionStatus = await getPermissionService().checkSystemAudioPermission();
+      if (permissionStatus !== 'granted') {
+        return;
+      }
+
+      await service.start({
+        sampleRate: 24000,
+        includeProcessNames: this.meetingProcessNames,
+      });
+    } catch (err) {
+      console.warn('Failed to start meeting detection monitor:', err);
+    }
+  }
+
+  private async stopMeetingDetectionMonitor(): Promise<void> {
+    const service = getSystemAudioService();
+
+    if (this.meetingDetectionListener) {
+      const detachableService = service as typeof service & {
+        off?: (event: string, listener: (event: MeetingAppDetectedEvent) => void) => void;
+        removeListener?: (event: string, listener: (event: MeetingAppDetectedEvent) => void) => void;
+      };
+      if (typeof detachableService.off === 'function') {
+        detachableService.off('meeting-app-detected', this.meetingDetectionListener);
+      } else if (typeof detachableService.removeListener === 'function') {
+        detachableService.removeListener('meeting-app-detected', this.meetingDetectionListener);
+      }
+      this.meetingDetectionListener = null;
+    }
+
+    if (service.currentStatus !== 'recording') {
+      return;
+    }
+    try {
+      await service.stop();
+    } catch (err) {
+      console.warn('Failed to stop meeting detection monitor:', err);
+    }
+  }
+
+  private handleMeetingAppDetected(event: MeetingAppDetectedEvent): void {
+    const appName = String(event?.appName || event?.processName || '').trim();
+    if (!appName) {
+      return;
+    }
+
+    const stateMachine = getStateMachine();
+    if (stateMachine.currentState !== 'idle' || this.isRecording || this.isMeetingModeEnabled) {
+      return;
+    }
+
+    const configService = getConfigService();
+    if (!configService.shouldPromptForMeetingApp(appName)) {
+      return;
+    }
+
+    const appKey = appName.toLowerCase();
+    const now = Date.now();
+    const lastPromptAt = this.meetingPromptTimestamps.get(appKey) || 0;
+    if (now - lastPromptAt < this.MEETING_PROMPT_COOLDOWN_MS) {
+      return;
+    }
+    this.meetingPromptTimestamps.set(appKey, now);
+
+    this.sendRendererEvent('meeting-mode-suggestion', {
+      appName,
+      processName: event.processName,
+      detectedAt: event.detectedAt,
+      message: 'Looks like a meeting is starting. Switch to Meeting Capture?',
+    });
+  }
+
+  private sendRendererEvent(channel: string, payload: Record<string, unknown>): void {
+    const mainWindow = this.mainWindow;
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+    const webContents = mainWindow.webContents;
+    if (!webContents || webContents.isDestroyed()) {
+      return;
+    }
+    if (webContents.isLoading()) {
+      console.warn(`Renderer is still loading, cannot send IPC event: ${channel}`);
+      return;
+    }
+    webContents.send(channel, payload);
   }
 }
 

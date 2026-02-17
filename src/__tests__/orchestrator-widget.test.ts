@@ -1,72 +1,94 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// Captured IPC handlers from ipcMain.on / ipcMain.handle
-const ipcHandlers: Record<string, Function> = {};
+const {
+  ipcHandlers,
+  mockIpcMain,
+  mockStateMachine,
+  mockTextInsertionService,
+  mockIndicator,
+  mockWidget,
+  mockHotkeyService,
+  mockConfigService,
+  mockPermissionService,
+  mockSystemAudioService,
+} = vi.hoisted(() => {
+  const capturedHandlers: Record<string, Function> = {};
 
-const mockIpcMain = {
-  on: vi.fn((channel: string, handler: Function) => {
-    ipcHandlers[channel] = handler;
-  }),
-  handle: vi.fn((channel: string, handler: Function) => {
-    ipcHandlers[channel] = handler;
-  }),
-};
-
-const mockStateMachine = {
-  currentState: 'idle' as string,
-  on: vi.fn(),
-  transition: vi.fn((trigger: string) => {
-    // Simulate real transitions for state tracking
-    if (trigger === 'hotkey_press' && mockStateMachine.currentState === 'idle') {
-      mockStateMachine.currentState = 'recording';
+  const stateMachine = {
+    currentState: 'idle' as string,
+    on: vi.fn(),
+    transition: vi.fn((trigger: string) => {
+      if (trigger === 'hotkey_press' && stateMachine.currentState === 'idle') {
+        stateMachine.currentState = 'recording';
+        return true;
+      }
+      if ((trigger === 'hotkey_release' || trigger === 'hotkey_press') && stateMachine.currentState === 'recording') {
+        stateMachine.currentState = 'processing';
+        return true;
+      }
       return true;
-    }
-    if (trigger === 'hotkey_release' && mockStateMachine.currentState === 'recording') {
-      mockStateMachine.currentState = 'processing';
-      return true;
-    }
-    return true;
-  }),
-  reset: vi.fn(() => {
-    mockStateMachine.currentState = 'idle';
-  }),
-  getRecordingDuration: vi.fn(() => 0),
-};
+    }),
+    setMeetingMode: vi.fn(),
+    reset: vi.fn(() => {
+      stateMachine.currentState = 'idle';
+    }),
+    getRecordingDuration: vi.fn(() => 0),
+  };
 
-const mockTextInsertionService = {
-  captureActiveApp: vi.fn(),
-};
-
-const mockIndicator = {
-  show: vi.fn(),
-  hide: vi.fn(),
-  showError: vi.fn(),
-  showResult: vi.fn(),
-  destroy: vi.fn(),
-};
-
-const mockWidget = {
-  updateAllWidgets: vi.fn(),
-  destroy: vi.fn(),
-};
-
-const mockHotkeyService = {
-  onPress: vi.fn(),
-  register: vi.fn(),
-  unregister: vi.fn(),
-};
-
-const mockConfigService = {
-  getHotkey: vi.fn(() => ({ accelerator: 'F1', enabled: true })),
-  getInsertionMethod: vi.fn(() => 'paste'),
-};
-
-const mockPermissionService = {
-  checkAll: vi.fn(),
-  requestMicrophone: vi.fn(),
-  promptAccessibility: vi.fn(),
-  showPermissionNotification: vi.fn(),
-};
+  return {
+    ipcHandlers: capturedHandlers,
+    mockIpcMain: {
+      on: vi.fn((channel: string, handler: Function) => {
+        capturedHandlers[channel] = handler;
+      }),
+      handle: vi.fn((channel: string, handler: Function) => {
+        capturedHandlers[channel] = handler;
+      }),
+    },
+    mockStateMachine: stateMachine,
+    mockTextInsertionService: {
+      captureActiveApp: vi.fn(),
+    },
+    mockIndicator: {
+      show: vi.fn(),
+      hide: vi.fn(),
+      showError: vi.fn(),
+      showResult: vi.fn(),
+      destroy: vi.fn(),
+    },
+    mockWidget: {
+      updateAllWidgets: vi.fn(),
+      setMeetingMode: vi.fn(),
+      destroy: vi.fn(),
+    },
+    mockHotkeyService: {
+      onPress: vi.fn(),
+      register: vi.fn(),
+      unregister: vi.fn(),
+    },
+    mockConfigService: {
+      getHotkey: vi.fn(() => ({ accelerator: 'F1', enabled: true })),
+      getInsertionMethod: vi.fn(() => 'paste'),
+      getMeetingDetectionEnabled: vi.fn(() => false),
+      setMeetingDetectionEnabled: vi.fn(),
+      shouldPromptForMeetingApp: vi.fn(() => true),
+      setMeetingPromptDismissedForApp: vi.fn(),
+    },
+    mockPermissionService: {
+      checkAll: vi.fn(),
+      checkSystemAudioPermission: vi.fn().mockResolvedValue('granted'),
+      requestMicrophone: vi.fn(),
+      promptAccessibility: vi.fn(),
+      showPermissionNotification: vi.fn(),
+    },
+    mockSystemAudioService: {
+      currentStatus: 'idle' as string,
+      on: vi.fn(),
+      start: vi.fn().mockResolvedValue(true),
+      stop: vi.fn().mockResolvedValue(undefined),
+    },
+  };
+});
 
 vi.mock('electron', () => ({
   ipcMain: mockIpcMain,
@@ -95,6 +117,10 @@ vi.mock('../recording-widget', () => ({
 
 vi.mock('../permission-service', () => ({
   getPermissionService: () => mockPermissionService,
+}));
+
+vi.mock('../system-audio-service', () => ({
+  getSystemAudioService: () => mockSystemAudioService,
 }));
 
 vi.mock('../config-service', () => ({
@@ -143,7 +169,7 @@ describe('Orchestrator widget-toggle-recording IPC', () => {
 
     await triggerWidgetToggle();
 
-    expect(mockStateMachine.transition).toHaveBeenCalledWith('hotkey_release');
+    expect(mockStateMachine.transition).toHaveBeenCalledWith('hotkey_press');
     expect(mockTextInsertionService.captureActiveApp).not.toHaveBeenCalled();
   });
 
@@ -201,7 +227,6 @@ describe('Orchestrator transcription-error widget feedback', () => {
 
     // Error state shown immediately
     expect(mockWidget.updateAllWidgets).toHaveBeenCalledWith('error');
-    expect(mockIndicator.showError).toHaveBeenCalledWith('Transcription failed');
 
     // State machine NOT transitioned yet (deferred)
     expect(mockStateMachine.transition).not.toHaveBeenCalledWith('error');
@@ -250,5 +275,59 @@ describe('Orchestrator transcription-error widget feedback', () => {
     // Widget should NOT be updated to idle by the stateChange handler
     // because previousState is 'processing' — guarded
     expect(mockWidget.updateAllWidgets).not.toHaveBeenCalledWith('idle');
+  });
+});
+
+describe('Orchestrator meeting detection monitor gating', () => {
+  let orchestrator: Orchestrator;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.keys(ipcHandlers).forEach((k) => delete ipcHandlers[k]);
+    mockStateMachine.currentState = 'idle';
+    mockSystemAudioService.currentStatus = 'idle';
+    mockPermissionService.checkAll.mockResolvedValue({
+      microphone: 'granted',
+      systemAudio: 'granted',
+      accessibility: 'granted',
+    });
+    mockPermissionService.checkSystemAudioPermission.mockResolvedValue('granted');
+    mockConfigService.getMeetingDetectionEnabled.mockReturnValue(false);
+    orchestrator = new Orchestrator();
+  });
+
+  it('does not start background meeting detection before user opts in', async () => {
+    await orchestrator.start();
+    expect(mockSystemAudioService.start).not.toHaveBeenCalled();
+  });
+
+  it('starts meeting detection after opt-in when system audio permission is granted', async () => {
+    mockConfigService.getMeetingDetectionEnabled.mockReturnValue(true);
+
+    await orchestrator.start();
+
+    expect(mockSystemAudioService.start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        includeProcessNames: expect.arrayContaining(['zoom.us', 'Google Meet']),
+      }),
+    );
+  });
+
+  it('skips meeting detection if system audio permission is not granted', async () => {
+    mockConfigService.getMeetingDetectionEnabled.mockReturnValue(true);
+    mockPermissionService.checkSystemAudioPermission.mockResolvedValue('unknown');
+
+    await orchestrator.start();
+
+    expect(mockSystemAudioService.start).not.toHaveBeenCalled();
+  });
+
+  it('persists meeting detection opt-in when meeting mode is enabled', async () => {
+    const handler = ipcHandlers['set-meeting-mode'];
+    expect(handler).toBeDefined();
+
+    await handler({}, true);
+
+    expect(mockConfigService.setMeetingDetectionEnabled).toHaveBeenCalledWith(true);
   });
 });

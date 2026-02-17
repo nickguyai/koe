@@ -60,6 +60,9 @@
     .widget-btn.recording {
       background: var(--vermillion);
     }
+    .widget-btn.recording.meeting {
+      background: var(--moss-stone);
+    }
     .widget-btn.recording svg {
       stroke: var(--washi-white);
     }
@@ -103,6 +106,15 @@
       animation-delay: 0.6s;
     }
 
+    .recording.meeting .pulse-ring {
+      border-color: var(--moss-stone);
+      animation: pulse 4s ease-out infinite;
+    }
+
+    .recording.meeting .pulse-ring.delay {
+      animation-delay: 1s;
+    }
+
     /* Spinner for processing */
     .widget-btn.processing svg.icon-processing {
       animation: spin 1.2s linear infinite;
@@ -143,7 +155,8 @@
     function updateWidget(state) {
       var btn = document.getElementById('btn');
       var icon = document.getElementById('icon');
-      btn.className = 'widget-btn ' + state.status;
+      var modeClass = state.mode === 'meeting' ? ' meeting' : '';
+      btn.className = 'widget-btn ' + state.status + modeClass;
       icon.innerHTML = icons[state.status] || icons.idle;
       if (state.status === 'processing') {
         icon.classList.add('icon-processing');

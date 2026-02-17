@@ -4,13 +4,19 @@ import * as path from 'path';
 import { getOrchestrator } from './orchestrator';
 import { initRecordingWidget } from './recording-widget';
 import { ConfigManager, AppSettings } from './backend/config-manager';
-import { GeminiTranscriber } from './backend/gemini-transcriber';
+import { GeminiTranscriber, MeetingNotes } from './backend/gemini-transcriber';
 import { TranscriptionJobQueue } from './backend/job-queue';
-import { OpenAIRealtimeClient, RealtimeTextEvent, RealtimeStructuredEvent } from './backend/openai-realtime';
+import { OpenAIRealtimeClient, RealtimeSegmentEvent, RealtimeStructuredEvent, RealtimeTextEvent } from './backend/openai-realtime';
 import { MemoryManager } from './backend/memory-manager';
 import { OpenAITranscriber } from './backend/openai-transcriber';
 import { SynthesisProcessor } from './backend/synthesis-processor';
 import { ConsensusTranscriber } from './backend/consensus-transcriber';
+import { MeetingNotesGenerator } from './backend/meeting-notes-generator';
+import { NotionMcpService } from './backend/notion-mcp-service';
+
+import { getSystemAudioService } from './system-audio-service';
+import { mixPcmBuffers } from './audio-mixer';
+import { getPermissionService } from './permission-service';
 
 // Handle EPIPE errors on stdout/stderr to prevent crashes when terminal is closed
 process.stdout?.on('error', (err) => {
@@ -34,6 +40,70 @@ let configManager: ConfigManager | null = null;
 let geminiTranscriber: GeminiTranscriber | null = null;
 let jobQueue: TranscriptionJobQueue | null = null;
 let openAIClient: OpenAIRealtimeClient | null = null;
+let meetingNotesGenerator: MeetingNotesGenerator | null = null;
+let memoryManager: MemoryManager | null = null;
+let notionMcpService: NotionMcpService | null = null;
+let realtimeMeetingMode = false;
+// Queue of system audio chunks for synchronized mixing with mic audio.
+// Using a queue instead of a single pointer prevents temporal misalignment:
+// - Single pointer causes duplication (same chunk mixed into multiple mic frames)
+// - Single pointer causes drops (intermediate chunks overwritten before mixing)
+const systemAudioQueue: Buffer[] = [];
+const MAX_SYSTEM_AUDIO_QUEUE_SIZE = 10; // ~400ms of audio at 24kHz with 960-sample chunks
+let systemAudioListenersBound = false;
+
+function bindSystemAudioEvents(): void {
+  if (systemAudioListenersBound) {
+    return;
+  }
+  const systemAudio = getSystemAudioService();
+  systemAudio.on('audio-data', (chunk: Buffer) => {
+    systemAudioQueue.push(chunk);
+    // Limit queue size to prevent unbounded memory growth if mic events lag
+    while (systemAudioQueue.length > MAX_SYSTEM_AUDIO_QUEUE_SIZE) {
+      systemAudioQueue.shift();
+    }
+  });
+  systemAudio.on('status', (status: string) => {
+    sendRealtimeEvent({ type: 'system_audio_status', status });
+  });
+  systemAudio.on('error', (err: Error) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn('[SystemAudio] Error, clearing audio queue:', message);
+    systemAudioQueue.length = 0;
+    sendRealtimeEvent({ type: 'system_audio_error', content: message });
+  });
+  systemAudioListenersBound = true;
+}
+
+async function startSystemAudioCapture(): Promise<boolean> {
+  bindSystemAudioEvents();
+
+  const permissionService = getPermissionService();
+  let permission = await permissionService.checkSystemAudioPermission();
+  if (permission !== 'granted' && permission !== 'unknown') {
+    const granted = await permissionService.requestSystemAudioPermission();
+    if (granted) {
+      permission = 'granted';
+    }
+  }
+
+  if (permission !== 'granted' && permission !== 'unknown') {
+    sendRealtimeEvent({ type: 'system_audio_permission', status: permission });
+    return false;
+  }
+
+  const started = await getSystemAudioService().start({ sampleRate: 24000 });
+  if (!started) {
+    sendRealtimeEvent({ type: 'system_audio_permission', status: 'unavailable' });
+  }
+  return started;
+}
+
+async function stopSystemAudioCapture(): Promise<void> {
+  systemAudioQueue.length = 0;
+  await getSystemAudioService().stop();
+}
 
 function getRendererPath(): string {
   return path.join(__dirname, '..', 'assets', 'realtime.html');
@@ -63,11 +133,42 @@ function getAudioMimeType(filePath: string): string {
   }
 }
 
+function normalizeSpeakerKey(value: string): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase();
+}
+
 function sendRealtimeEvent(payload: Record<string, unknown>): void {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return;
   }
   mainWindow.webContents.send('openai-realtime-event', payload);
+}
+
+async function generateMeetingNotesInBackground(jobId: string, transcriptText: string): Promise<void> {
+  if (!meetingNotesGenerator || !jobQueue) {
+    return;
+  }
+
+  try {
+    const notes = await meetingNotesGenerator.generate(transcriptText);
+    const updated = jobQueue.updateMeetingNotes(jobId, notes);
+    sendRealtimeEvent({
+      type: 'meeting_notes_ready',
+      jobId,
+      meetingNotes: updated.meeting_notes,
+      updatedAt: updated.updated_at,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`Meeting notes generation failed for job ${jobId}:`, message);
+    sendRealtimeEvent({
+      type: 'meeting_notes_failed',
+      jobId,
+      content: message,
+    });
+  }
 }
 
 function registerBackendIpcHandlers(): void {
@@ -95,7 +196,35 @@ function registerBackendIpcHandlers(): void {
       next.defaultMode = normalized;
       next.defaultProvider = normalized;
     }
-    return configManager!.updateSettings(next);
+    const updated = configManager!.updateSettings(next);
+    if (updates.speakerLabels && memoryManager) {
+      memoryManager.syncSpeakerLabels(updated.speakerLabels || {});
+    }
+    return updated;
+  });
+
+  ipcMain.handle('speaker-label-remember', (_event, payload: { speakerKey?: string; label?: string }) => {
+    const speakerKey = normalizeSpeakerKey(payload?.speakerKey || '');
+    const label = String(payload?.label || '').trim();
+    if (!speakerKey || !label) {
+      throw new Error('speakerKey and label are required');
+    }
+
+    const current = configManager!.getSettings().speakerLabels || {};
+    const nextLabels = {
+      ...current,
+      [speakerKey]: label,
+    };
+    const updated = configManager!.updateSettings({ speakerLabels: nextLabels });
+    if (memoryManager) {
+      memoryManager.rememberSpeakerLabel(speakerKey, label);
+    }
+
+    return {
+      speakerKey,
+      label,
+      speakerLabels: updated.speakerLabels,
+    };
   });
 
   ipcMain.handle('transcription-job-enqueue', async (_event, payload: { path?: string; name?: string; bytes?: ArrayBuffer }) => {
@@ -109,16 +238,112 @@ function registerBackendIpcHandlers(): void {
     throw new Error('Missing audio payload');
   });
 
+  ipcMain.handle('live-audio-save', (_event, payload: { audioBytes?: ArrayBuffer; duration?: string; provider?: string }) => {
+    if (!payload?.audioBytes) {
+      throw new Error('Missing audio payload');
+    }
+    const audioBuffer = Buffer.from(new Uint8Array(payload.audioBytes));
+    return jobQueue!.createAudioOnlyJob(payload?.provider || 'openai', audioBuffer, payload?.duration);
+  });
+
+  ipcMain.handle(
+    'live-audio-complete',
+    async (
+      _event,
+      payload: {
+        jobId?: string;
+        text?: string;
+        title?: string;
+        summary?: string;
+        meetingMode?: boolean;
+        meetingNotes?: MeetingNotes;
+      },
+    ) => {
+      const jobId = String(payload?.jobId || '').trim();
+      if (!jobId) {
+        throw new Error('Job ID is required');
+      }
+      const text = String(payload?.text || '').trim();
+      if (!text) {
+        throw new Error('Missing transcription text');
+      }
+
+      const existing = jobQueue!.getJob(jobId);
+      if (!existing) {
+        throw new Error('Job not found');
+      }
+
+      const isMeetingMode = Boolean(payload?.meetingMode);
+      const meetingNotes = payload?.meetingNotes;
+      const diarizationStatus = isMeetingMode && existing.audio_path ? 'pending' : undefined;
+      const completed = jobQueue!.completeAudioOnlyJob(
+        jobId,
+        text,
+        payload?.title,
+        payload?.summary || meetingNotes?.summary,
+        meetingNotes,
+        diarizationStatus,
+        isMeetingMode,
+      );
+
+      if (isMeetingMode && diarizationStatus === 'pending') {
+        jobQueue!.enqueueDiarization(jobId);
+      }
+
+      if (isMeetingMode && !meetingNotes && meetingNotesGenerator) {
+        void generateMeetingNotesInBackground(jobId, text);
+      }
+
+      return completed;
+    },
+  );
+
   ipcMain.handle(
     'transcription-job-save',
-    (_event, payload: { text?: string; title?: string; summary?: string; provider?: string; audioBytes?: ArrayBuffer; duration?: string }) => {
+    async (
+      _event,
+      payload: {
+        text?: string;
+        title?: string;
+        summary?: string;
+        provider?: string;
+        audioBytes?: ArrayBuffer;
+        duration?: string;
+        meetingMode?: boolean;
+        meetingNotes?: MeetingNotes;
+      },
+    ) => {
       const text = String(payload?.text || '').trim();
       if (!text) {
         throw new Error('Missing transcription text');
       }
       const provider = payload?.provider || 'openai';
       const audioBuffer = payload?.audioBytes ? Buffer.from(new Uint8Array(payload.audioBytes)) : undefined;
-      return jobQueue!.createTextJob(text, provider, payload?.title, payload?.summary, audioBuffer, payload?.duration);
+      const isMeetingMode = Boolean(payload?.meetingMode);
+      const meetingNotes = payload?.meetingNotes;
+      const diarizationStatus = isMeetingMode && audioBuffer && audioBuffer.length > 0 ? 'pending' : undefined;
+
+      const created = jobQueue!.createTextJob(
+        text,
+        provider,
+        payload?.title,
+        payload?.summary || meetingNotes?.summary,
+        audioBuffer,
+        payload?.duration,
+        meetingNotes,
+        diarizationStatus,
+        isMeetingMode,
+      );
+
+      if (isMeetingMode && diarizationStatus === 'pending') {
+        jobQueue!.enqueueDiarization(created.job.id);
+      }
+
+      if (isMeetingMode && !meetingNotes && meetingNotesGenerator) {
+        void generateMeetingNotesInBackground(created.job.id, text);
+      }
+
+      return created;
     },
   );
 
@@ -133,6 +358,13 @@ function registerBackendIpcHandlers(): void {
     }
     const result = jobQueue!.readJobResult(jobId);
     return result ? { ...record, result } : record;
+  });
+
+  ipcMain.handle('transcription-job-retranscribe', (_event, jobId: string) => {
+    if (!jobId) {
+      throw new Error('Job ID is required');
+    }
+    return jobQueue!.retranscribeJob(jobId);
   });
 
   ipcMain.handle('transcription-job-audio', (_event, jobId: string) => {
@@ -233,21 +465,53 @@ function registerBackendIpcHandlers(): void {
     return exportData;
   });
 
-  ipcMain.handle('openai-realtime-start', async () => {
+  ipcMain.handle('transcription-job-share-notion', async (_event, payload: { jobId?: string }) => {
+    const jobId = String(payload?.jobId || '').trim();
+    if (!jobId) {
+      throw new Error('Job ID is required');
+    }
+
+    const exportData = jobQueue!.getJobExportData(jobId);
+    if (!exportData || !exportData.markdown) {
+      throw new Error('No meeting notes available to share');
+    }
+
+    if (!notionMcpService || !notionMcpService.isConfigured()) {
+      return {
+        ok: false,
+        message: 'Notion MCP is not configured',
+      };
+    }
+
+    return notionMcpService.shareMeetingMarkdown({
+      title: exportData.title || 'Meeting Notes',
+      markdown: exportData.markdown,
+    });
+  });
+
+  ipcMain.handle('openai-realtime-start', async (_event, payload?: { meetingMode?: boolean }) => {
     const apiKey = configManager!.getApiKey('openai');
     if (!apiKey) {
       throw new Error('OpenAI API key is not set');
     }
+    realtimeMeetingMode = Boolean(payload?.meetingMode);
+
     if (openAIClient) {
       await openAIClient.disconnect();
       openAIClient = null;
     }
-    openAIClient = new OpenAIRealtimeClient(apiKey);
+    await stopSystemAudioCapture();
+
+    const language = configManager!.getSettings().language || 'en';
+    openAIClient = new OpenAIRealtimeClient(apiKey, undefined, undefined, undefined, language);
     openAIClient.on('status', (status: string) => {
       sendRealtimeEvent({ type: 'status', status });
     });
     openAIClient.on('text', (event: RealtimeTextEvent) => {
       sendRealtimeEvent({ type: 'text', content: event.content, isNewResponse: event.isNewResponse });
+    });
+    openAIClient.on('segment', (event: RealtimeSegmentEvent) => {
+      sendRealtimeEvent({ type: 'segment', segment: event.segment, allSegments: event.allSegments });
     });
     openAIClient.on('structured_result', (event: RealtimeStructuredEvent) => {
       sendRealtimeEvent({ type: 'structured_result', result: event.result });
@@ -255,25 +519,51 @@ function registerBackendIpcHandlers(): void {
     openAIClient.on('error', (message: string) => {
       sendRealtimeEvent({ type: 'error', content: message });
     });
-    await openAIClient.connect();
+
+    if (realtimeMeetingMode) {
+      await startSystemAudioCapture();
+      await openAIClient.startMeeting();
+    } else {
+      await openAIClient.connect();
+    }
+
     return true;
   });
 
-  ipcMain.on('openai-realtime-audio', (_event, audio: ArrayBuffer) => {
+  ipcMain.on('openai-realtime-audio', (_event, audio: ArrayBuffer | Buffer) => {
     if (!openAIClient) {
       return;
     }
-    void openAIClient.sendAudio(audio);
+    const micBuffer = Buffer.isBuffer(audio) ? audio : Buffer.from(new Uint8Array(audio));
+    if (!realtimeMeetingMode) {
+      void openAIClient.sendAudio(micBuffer);
+      return;
+    }
+
+    // Dequeue one system audio chunk per mic frame for temporal alignment.
+    // If no system chunk available, mix with silence (null).
+    const systemChunk = systemAudioQueue.shift() ?? null;
+    const mixed = mixPcmBuffers(micBuffer, systemChunk);
+    void openAIClient.sendAudio(mixed.length > 0 ? mixed : micBuffer);
   });
 
-  ipcMain.handle('openai-realtime-stop', async () => {
+  ipcMain.handle('openai-realtime-stop', async (_event, payload?: { meetingMode?: boolean }) => {
+    const isMeeting = Boolean(payload?.meetingMode) || realtimeMeetingMode;
     if (openAIClient) {
+      if (isMeeting) {
+        const transcript = await openAIClient.stopMeeting();
+        await stopSystemAudioCapture();
+        realtimeMeetingMode = false;
+        return { transcript };
+      }
       await openAIClient.commitAudio();
     }
     return true;
   });
 
   ipcMain.handle('openai-realtime-disconnect', async () => {
+    realtimeMeetingMode = false;
+    await stopSystemAudioCapture();
     if (openAIClient) {
       await openAIClient.disconnect();
       openAIClient = null;
@@ -281,13 +571,37 @@ function registerBackendIpcHandlers(): void {
     return true;
   });
 
+  ipcMain.handle('system-audio-start', async () => {
+    return startSystemAudioCapture();
+  });
+
+  ipcMain.handle('system-audio-stop', async () => {
+    await stopSystemAudioCapture();
+    return true;
+  });
+
+  ipcMain.handle('system-audio-status', () => {
+    const service = getSystemAudioService();
+    return service.currentStatus;
+  });
+
+  ipcMain.handle('system-audio-permission-check', async () => {
+    return getPermissionService().checkSystemAudioPermission();
+  });
+
+  ipcMain.handle('system-audio-permission-request', async () => {
+    return getPermissionService().requestSystemAudioPermission();
+  });
+
   ipcMain.handle('open-external', async (_event, url: string) => {
     try {
       const parsed = new URL(url);
-      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      const allowedProtocols = new Set(['https:', 'http:', 'mailto:']);
+      if (allowedProtocols.has(parsed.protocol)) {
         await shell.openExternal(url);
         return true;
       }
+      console.warn('Blocked URL protocol for openExternal:', parsed.protocol);
     } catch {
       console.warn('Invalid URL for openExternal:', url);
     }
@@ -426,9 +740,11 @@ app.commandLine.appendSwitch('enable-speech-dispatcher');
 app.whenReady().then(async () => {
   configManager = new ConfigManager();
   geminiTranscriber = new GeminiTranscriber(configManager);
+  meetingNotesGenerator = new MeetingNotesGenerator(configManager);
+  notionMcpService = new NotionMcpService();
 
   // Initialize consensus transcription services
-  const memoryManager = new MemoryManager(configManager);
+  memoryManager = new MemoryManager(configManager);
   const openAITranscriber = new OpenAITranscriber(configManager);
   const synthesisProcessor = new SynthesisProcessor(configManager);
   const consensusTranscriber = new ConsensusTranscriber(configManager, openAITranscriber, synthesisProcessor, memoryManager);
@@ -516,6 +832,7 @@ app.on('will-quit', (event) => {
     void openAIClient.disconnect();
     openAIClient = null;
   }
+  void stopSystemAudioCapture();
 
   // Force exit after cleanup — keyspy child process can keep the app alive
   // if SIGTERM doesn't kill the native binary fast enough.

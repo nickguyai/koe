@@ -1,9 +1,11 @@
 import { systemPreferences, shell, dialog, Notification } from 'electron';
+import * as os from 'os';
 
 export type PermissionState = 'granted' | 'denied' | 'not_determined' | 'restricted' | 'unknown';
 
 export interface PermissionStatus {
   microphone: PermissionState;
+  systemAudio: PermissionState;
   accessibility: PermissionState;
 }
 
@@ -14,6 +16,7 @@ export class PermissionService {
   async checkAll(): Promise<PermissionStatus> {
     return {
       microphone: await this.checkMicrophone(),
+      systemAudio: await this.checkSystemAudioPermission(),
       accessibility: this.checkAccessibility(),
     };
   }
@@ -43,6 +46,57 @@ export class PermissionService {
       return granted;
     } catch (err) {
       console.error('Error requesting microphone permission:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Check system audio recording permission.
+   * AudioTee requires macOS 14.2+ and system audio capture permission.
+   */
+  async checkSystemAudioPermission(): Promise<PermissionState> {
+    if (process.platform !== 'darwin') {
+      return 'granted';
+    }
+
+    if (!this.isMacOS14_2OrLater()) {
+      return 'restricted';
+    }
+
+    try {
+      const rawStatus = (systemPreferences as any).getMediaAccessStatus?.('audio');
+      if (!rawStatus) {
+        return 'unknown';
+      }
+      return this.mapMediaStatus(String(rawStatus));
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  /**
+   * Request system audio recording permission.
+   */
+  async requestSystemAudioPermission(): Promise<boolean> {
+    if (process.platform !== 'darwin') {
+      return true;
+    }
+
+    if (!this.isMacOS14_2OrLater()) {
+      return false;
+    }
+
+    try {
+      const askForMediaAccess = (systemPreferences as any).askForMediaAccess;
+      if (typeof askForMediaAccess !== 'function') {
+        // Some Electron builds don't expose explicit system-audio permission APIs.
+        // Allow capture attempt so native layer can request/fail gracefully.
+        return true;
+      }
+      const granted = await askForMediaAccess.call(systemPreferences, 'audio');
+      return Boolean(granted);
+    } catch (err) {
+      console.error('Error requesting system audio permission:', err);
       return false;
     }
   }
@@ -91,6 +145,15 @@ export class PermissionService {
   }
 
   /**
+   * Open System Preferences to System Audio Recording settings
+   */
+  openSystemAudioSettings(): void {
+    if (process.platform === 'darwin') {
+      shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture');
+    }
+  }
+
+  /**
    * Show permission setup dialog
    */
   async showPermissionDialog(status: PermissionStatus): Promise<void> {
@@ -98,6 +161,9 @@ export class PermissionService {
 
     if (status.microphone !== 'granted') {
       missingPermissions.push('Microphone (for voice recording)');
+    }
+    if (status.systemAudio !== 'granted') {
+      missingPermissions.push('System Audio Recording (for meeting capture of remote participants)');
     }
     if (status.accessibility !== 'granted') {
       missingPermissions.push('Accessibility (for text insertion)');
@@ -120,6 +186,8 @@ export class PermissionService {
       // Open the appropriate settings
       if (status.microphone !== 'granted') {
         this.openMicrophoneSettings();
+      } else if (status.systemAudio !== 'granted') {
+        this.openSystemAudioSettings();
       } else if (status.accessibility !== 'granted') {
         this.openAccessibilitySettings();
       }
@@ -129,14 +197,16 @@ export class PermissionService {
   /**
    * Show notification about missing permissions
    */
-  showPermissionNotification(permission: 'microphone' | 'accessibility'): void {
+  showPermissionNotification(permission: 'microphone' | 'system_audio' | 'accessibility'): void {
     const titles: Record<string, string> = {
       microphone: 'Microphone Access Required',
+      system_audio: 'System Audio Access Required',
       accessibility: 'Accessibility Access Required',
     };
 
     const bodies: Record<string, string> = {
       microphone: 'Please grant microphone access in System Preferences to use voice transcription.',
+      system_audio: 'Please grant system audio recording access to capture meeting audio from other participants.',
       accessibility: 'Please grant accessibility access in System Preferences to enable text insertion.',
     };
 
@@ -148,6 +218,8 @@ export class PermissionService {
     notification.on('click', () => {
       if (permission === 'microphone') {
         this.openMicrophoneSettings();
+      } else if (permission === 'system_audio') {
+        this.openSystemAudioSettings();
       } else {
         this.openAccessibilitySettings();
       }
@@ -172,6 +244,26 @@ export class PermissionService {
       default:
         return 'unknown';
     }
+  }
+
+  private isMacOS14_2OrLater(): boolean {
+    if (process.platform !== 'darwin') {
+      return true;
+    }
+
+    const [major, minor] = os.release()
+      .split('.')
+      .map((part) => Number.parseInt(part, 10));
+    if (Number.isNaN(major)) {
+      return false;
+    }
+    if (major > 23) {
+      return true;
+    }
+    if (major < 23) {
+      return false;
+    }
+    return !Number.isNaN(minor) && minor >= 2;
   }
 }
 

@@ -1,14 +1,16 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { ConfigManager } from './config-manager';
-import { GeminiTranscriber, TranscriptionResult } from './gemini-transcriber';
+import { DiarizationStatus, GeminiTranscriber, MeetingNotes, SpeechSegment, TranscriptionResult } from './gemini-transcriber';
 import { ConsensusTranscriber } from './consensus-transcriber';
+import { formatMeetingMarkdownExport } from './meeting-notes-generator';
 
 export type JobStatus = 'pending' | 'processing' | 'completed' | 'failed';
 
 export interface JobRecord {
   id: string;
   status: JobStatus;
+  diarization_status?: DiarizationStatus;
   created_at: string;
   updated_at: string;
   provider: string;
@@ -23,6 +25,8 @@ export interface JobRecord {
 export class TranscriptionJobQueue {
   private queue: string[] = [];
   private processing = false;
+  private diarizationQueue: string[] = [];
+  private diarizationProcessing = false;
   private workerTimer: NodeJS.Timeout | null = null;
   private config: ConfigManager;
   private transcriber: GeminiTranscriber;
@@ -39,6 +43,7 @@ export class TranscriptionJobQueue {
     if (!this.workerTimer) {
       this.workerTimer = setInterval(() => {
         void this.processNext();
+        void this.processNextDiarization();
       }, 750);
     }
   }
@@ -67,6 +72,9 @@ export class TranscriptionJobQueue {
     summary?: string,
     audioBytes?: Buffer,
     duration?: string,
+    meetingNotes?: MeetingNotes,
+    diarizationStatus?: DiarizationStatus,
+    isMeeting?: boolean,
   ): { job: JobRecord; result: TranscriptionResult } {
     const cleaned = this.cleanText(text);
     if (!cleaned) {
@@ -82,6 +90,9 @@ export class TranscriptionJobQueue {
       title: this.buildTitle(cleaned, title),
       summary: this.buildSummary(cleaned, summary),
       speech_segments: this.buildSegments(cleaned),
+      is_meeting: isMeeting || undefined,
+      meeting_notes: meetingNotes,
+      diarization_status: diarizationStatus,
     };
 
     const resultPath = this.transcriptionPath(jobId);
@@ -97,6 +108,7 @@ export class TranscriptionJobQueue {
     const record: JobRecord = {
       id: jobId,
       status: 'completed',
+      diarization_status: diarizationStatus,
       created_at: now.toISOString(),
       updated_at: now.toISOString(),
       provider,
@@ -109,6 +121,80 @@ export class TranscriptionJobQueue {
     this.writeJob(record);
 
     return { job: record, result };
+  }
+
+  createAudioOnlyJob(provider: string = 'openai', audioBytes: Buffer, duration?: string): JobRecord {
+    if (!audioBytes || audioBytes.length === 0) {
+      throw new Error('Audio payload is empty');
+    }
+
+    const now = new Date();
+    const jobId = this.formatJobId(now);
+    const jobDir = this.jobDir(jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+
+    const audioPath = path.join(jobDir, 'recording.webm');
+    fs.writeFileSync(audioPath, audioBytes);
+
+    const record: JobRecord = {
+      id: jobId,
+      status: 'failed',
+      created_at: now.toISOString(),
+      updated_at: now.toISOString(),
+      provider: String(provider || 'openai'),
+      audio_path: audioPath,
+      duration,
+      error: 'Transcription in progress',
+    };
+    this.writeJob(record);
+    return record;
+  }
+
+  completeAudioOnlyJob(
+    jobId: string,
+    text: string,
+    title?: string,
+    summary?: string,
+    meetingNotes?: MeetingNotes,
+    diarizationStatus?: DiarizationStatus,
+    isMeeting?: boolean,
+  ): { job: JobRecord; result: TranscriptionResult } {
+    this.validateJobId(jobId);
+    const record = this.readJob(jobId);
+    if (!record) {
+      throw new Error('Job not found');
+    }
+
+    const cleaned = this.cleanText(text);
+    if (!cleaned) {
+      throw new Error('Transcription text is empty');
+    }
+
+    const result: TranscriptionResult = {
+      title: this.buildTitle(cleaned, title),
+      summary: this.buildSummary(cleaned, summary),
+      speech_segments: this.buildSegments(cleaned),
+      is_meeting: isMeeting || undefined,
+      meeting_notes: meetingNotes,
+      diarization_status: diarizationStatus,
+    };
+
+    const resultPath = this.transcriptionPath(jobId);
+    fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf-8');
+
+    const updated: JobRecord = {
+      ...record,
+      status: 'completed',
+      diarization_status: diarizationStatus,
+      updated_at: new Date().toISOString(),
+      result_path: resultPath,
+      title: result.title,
+      summary: result.summary,
+      error: undefined,
+    };
+    this.writeJob(updated);
+
+    return { job: updated, result };
   }
 
   getJob(jobId: string): JobRecord | null {
@@ -169,6 +255,54 @@ export class TranscriptionJobQueue {
     return true;
   }
 
+  retranscribeJob(jobId: string): JobRecord {
+    this.validateJobId(jobId);
+    const record = this.readJob(jobId);
+    if (!record) {
+      throw new Error('Job not found');
+    }
+    if (record.status === 'pending' || record.status === 'processing') {
+      throw new Error('Cannot re-transcribe a job that is pending or processing');
+    }
+    if (!record.audio_path) {
+      throw new Error('Job does not have an audio file');
+    }
+
+    const recordingsResolved = path.resolve(this.recordingsDir());
+    const resolvedAudio = path.resolve(recordingsResolved, record.audio_path);
+    if (resolvedAudio === recordingsResolved || !resolvedAudio.startsWith(recordingsResolved + path.sep)) {
+      throw new Error('Invalid audio file path');
+    }
+    if (!fs.existsSync(resolvedAudio)) {
+      throw new Error('Audio file not found');
+    }
+    const audioStat = fs.statSync(resolvedAudio);
+    if (!audioStat.isFile()) {
+      throw new Error('Audio path is not a file');
+    }
+
+    const transcriptionPath = this.transcriptionPath(jobId);
+    if (fs.existsSync(transcriptionPath)) {
+      fs.unlinkSync(transcriptionPath);
+    }
+    const summaryPath = path.join(this.jobDir(jobId), 'summary.txt');
+    if (fs.existsSync(summaryPath)) {
+      fs.unlinkSync(summaryPath);
+    }
+
+    record.status = 'pending';
+    record.error = undefined;
+    record.result_path = undefined;
+    record.updated_at = new Date().toISOString();
+    this.writeJob(record);
+
+    if (!this.queue.includes(jobId)) {
+      this.queue.push(jobId);
+    }
+
+    return record;
+  }
+
   getJobExportData(jobId: string): { title: string; markdown: string; filename: string } | null {
     this.validateJobId(jobId);
     const record = this.readJob(jobId);
@@ -186,18 +320,18 @@ export class TranscriptionJobQueue {
       transcript = result.speech_segments.map((seg) => seg.content).join('\n\n');
     }
 
-    const lines: string[] = [`# ${title}`, ''];
-    if (summary) {
-      lines.push('## Summary', '', summary, '');
-    }
-    if (transcript) {
-      lines.push('## Transcript', '', transcript);
-    }
+    const markdown = formatMeetingMarkdownExport({
+      title,
+      summary,
+      transcript,
+      meetingNotes: result?.meeting_notes || null,
+      createdAt: record.created_at,
+    });
 
     const safeTitle = title.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 50);
     const filename = `${safeTitle}_${jobId}.md`;
 
-    return { title, markdown: lines.join('\n'), filename };
+    return { title, markdown, filename };
   }
 
   updateReadability(jobId: string, text: string): { text: string; updated_at: string } {
@@ -214,6 +348,59 @@ export class TranscriptionJobQueue {
     data.readability = readability;
     fs.writeFileSync(resultPath, JSON.stringify(data, null, 2), 'utf-8');
     return readability;
+  }
+
+  updateMeetingNotes(jobId: string, notes: MeetingNotes): { meeting_notes: MeetingNotes; updated_at: string } {
+    const resultPath = this.transcriptionPath(jobId);
+    if (!fs.existsSync(resultPath)) {
+      throw new Error('Transcription result not found');
+    }
+
+    const raw = fs.readFileSync(resultPath, 'utf-8');
+    const data = JSON.parse(raw) as TranscriptionResult;
+    const updatedAt = new Date().toISOString();
+
+    data.meeting_notes = notes;
+    if (notes.summary && String(notes.summary).trim()) {
+      data.summary = notes.summary.trim();
+    }
+    fs.writeFileSync(resultPath, JSON.stringify(data, null, 2), 'utf-8');
+
+    const record = this.readJob(jobId);
+    if (record) {
+      if (notes.summary && String(notes.summary).trim()) {
+        record.summary = notes.summary.trim();
+      }
+      record.updated_at = updatedAt;
+      this.writeJob(record);
+    }
+
+    return {
+      meeting_notes: notes,
+      updated_at: updatedAt,
+    };
+  }
+
+  enqueueDiarization(jobId: string): boolean {
+    const record = this.readJob(jobId);
+    if (!record || !record.audio_path) {
+      return false;
+    }
+    if (record.status !== 'completed') {
+      return false;
+    }
+    if (record.diarization_status === 'completed' || record.diarization_status === 'processing') {
+      return false;
+    }
+
+    record.diarization_status = 'pending';
+    record.updated_at = new Date().toISOString();
+    this.writeJob(record);
+
+    if (!this.diarizationQueue.includes(jobId)) {
+      this.diarizationQueue.push(jobId);
+    }
+    return true;
   }
 
   private recordingsDir(): string {
@@ -393,6 +580,9 @@ export class TranscriptionJobQueue {
       if (job.status === 'pending' || job.status === 'processing') {
         this.queue.push(job.id);
       }
+      if (job.status === 'completed' && (job.diarization_status === 'pending' || job.diarization_status === 'processing')) {
+        this.diarizationQueue.push(job.id);
+      }
     }
   }
 
@@ -468,5 +658,72 @@ export class TranscriptionJobQueue {
       record.updated_at = new Date().toISOString();
       this.writeJob(record);
     }
+  }
+
+  private async processNextDiarization(): Promise<void> {
+    if (this.diarizationProcessing || this.diarizationQueue.length === 0) {
+      return;
+    }
+
+    const jobId = this.diarizationQueue.shift();
+    if (!jobId) {
+      return;
+    }
+
+    this.diarizationProcessing = true;
+    try {
+      await this.processDiarization(jobId);
+    } finally {
+      this.diarizationProcessing = false;
+    }
+  }
+
+  private async processDiarization(jobId: string): Promise<void> {
+    const record = this.readJob(jobId);
+    if (!record || record.status !== 'completed' || !record.audio_path) {
+      return;
+    }
+
+    record.diarization_status = 'processing';
+    record.updated_at = new Date().toISOString();
+    this.writeJob(record);
+
+    try {
+      const resultPath = this.transcriptionPath(jobId);
+      if (!fs.existsSync(resultPath)) {
+        throw new Error('Transcription result not found');
+      }
+
+      const existingRaw = fs.readFileSync(resultPath, 'utf-8');
+      const existing = JSON.parse(existingRaw) as TranscriptionResult;
+
+      const diarized = await this.transcriber.transcribeAudio(record.audio_path, undefined, {
+        applySmartFormatting: false,
+      });
+      existing.speech_segments = this.normalizeSegments(diarized.speech_segments);
+      existing.diarization_status = 'completed';
+      fs.writeFileSync(resultPath, JSON.stringify(existing, null, 2), 'utf-8');
+
+      record.diarization_status = 'completed';
+      record.updated_at = new Date().toISOString();
+      this.writeJob(record);
+    } catch (err) {
+      record.diarization_status = 'failed';
+      record.error = err instanceof Error ? err.message : String(err);
+      record.updated_at = new Date().toISOString();
+      this.writeJob(record);
+    }
+  }
+
+  private normalizeSegments(segments: SpeechSegment[]): SpeechSegment[] {
+    if (!Array.isArray(segments)) {
+      return [];
+    }
+    return segments.map((segment, index) => ({
+      content: String(segment.content || '').trim(),
+      start_time: String(segment.start_time || ''),
+      end_time: String(segment.end_time || ''),
+      speaker: String(segment.speaker || `Speaker ${index + 1}`),
+    }));
   }
 }

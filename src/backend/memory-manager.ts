@@ -11,8 +11,16 @@ export interface MemoryTerm {
   lastSeen: string;
 }
 
+export interface SpeakerVoiceProfile {
+  speakerKey: string;
+  label: string;
+  frequency: number;
+  lastSeen: string;
+}
+
 interface MemoryStore {
   terms: MemoryTerm[];
+  speakerProfiles: SpeakerVoiceProfile[];
   version: number;
 }
 
@@ -38,13 +46,17 @@ export class MemoryManager {
         const raw = fs.readFileSync(this.storePath, 'utf-8');
         const data = JSON.parse(raw) as MemoryStore;
         if (Array.isArray(data.terms)) {
-          return data;
+          return {
+            terms: data.terms,
+            speakerProfiles: Array.isArray(data.speakerProfiles) ? data.speakerProfiles : [],
+            version: data.version || 1,
+          };
         }
       } catch (err) {
         console.warn('Failed to load vocabulary memory:', err);
       }
     }
-    return { terms: [], version: 1 };
+    return { terms: [], speakerProfiles: [], version: 1 };
   }
 
   private saveStore(): void {
@@ -90,6 +102,109 @@ export class MemoryManager {
     }));
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, n).map((s) => s.term);
+  }
+
+  getKnownSpeakerLabels(limit: number = 20): string[] {
+    const fromMemory = this.store.speakerProfiles
+      .slice()
+      .sort((a, b) => {
+        if (b.frequency !== a.frequency) {
+          return b.frequency - a.frequency;
+        }
+        return new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime();
+      })
+      .map((profile) => String(profile.label || '').trim())
+      .filter(Boolean);
+
+    const fromSettings = Object.values(this.config.getSettings().speakerLabels || {})
+      .map((label) => String(label || '').trim())
+      .filter(Boolean);
+
+    return Array.from(new Set([...fromMemory, ...fromSettings])).slice(0, Math.max(1, limit));
+  }
+
+  syncSpeakerLabels(labels: Record<string, string>): void {
+    if (!labels || typeof labels !== 'object') {
+      return;
+    }
+
+    let changed = false;
+    const now = new Date().toISOString();
+
+    for (const [speakerKey, label] of Object.entries(labels)) {
+      const key = this.normalizeSpeakerKey(speakerKey);
+      const normalizedLabel = String(label || '').trim();
+      if (!key || !normalizedLabel) {
+        continue;
+      }
+
+      const existing = this.store.speakerProfiles.find((profile) => profile.speakerKey === key);
+      if (existing) {
+        if (existing.label !== normalizedLabel) {
+          existing.label = normalizedLabel;
+          existing.lastSeen = now;
+          changed = true;
+        }
+      } else {
+        this.store.speakerProfiles.push({
+          speakerKey: key,
+          label: normalizedLabel,
+          frequency: 1,
+          lastSeen: now,
+        });
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.saveStore();
+    }
+  }
+
+  rememberSpeakerLabel(speakerKey: string, label: string): void {
+    const key = this.normalizeSpeakerKey(speakerKey);
+    const normalizedLabel = String(label || '').trim();
+    if (!key || !normalizedLabel) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const existing = this.store.speakerProfiles.find((profile) => profile.speakerKey === key);
+    if (existing) {
+      existing.label = normalizedLabel;
+      existing.frequency += 1;
+      existing.lastSeen = now;
+    } else {
+      this.store.speakerProfiles.push({
+        speakerKey: key,
+        label: normalizedLabel,
+        frequency: 1,
+        lastSeen: now,
+      });
+    }
+
+    this.saveStore();
+  }
+
+  rememberSpeakerLabels(labels: Record<string, string>): void {
+    if (!labels || typeof labels !== 'object') {
+      return;
+    }
+    for (const [speakerKey, label] of Object.entries(labels)) {
+      this.rememberSpeakerLabel(speakerKey, label);
+    }
+  }
+
+  getSpeakerLabel(speakerKey: string): string | null {
+    const key = this.normalizeSpeakerKey(speakerKey);
+    if (!key) {
+      return null;
+    }
+    const profile = this.store.speakerProfiles.find((item) => item.speakerKey === key);
+    if (profile?.label) {
+      return profile.label;
+    }
+    return this.config.getSettings().speakerLabels?.[key] || null;
   }
 
   async updateFromTranscription(text: string): Promise<void> {
@@ -184,7 +299,14 @@ Return only valid JSON array, no other text.`;
   }
 
   clearMemory(): void {
-    this.store = { terms: [], version: 1 };
+    this.store = { terms: [], speakerProfiles: [], version: 1 };
     this.saveStore();
+  }
+
+  private normalizeSpeakerKey(value: string): string {
+    return String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
   }
 }

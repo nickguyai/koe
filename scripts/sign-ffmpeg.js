@@ -1,4 +1,4 @@
-// afterPack hook: codesign bundled ffmpeg/ffprobe for macOS notarization.
+// afterPack hook: codesign bundled media binaries for macOS notarization.
 // electron-builder runs this before the final app signature is applied.
 
 const { execSync } = require('child_process');
@@ -17,7 +17,7 @@ exports.default = async function (context) {
     return;
   }
 
-  for (const name of ['ffmpeg', 'ffprobe']) {
+  for (const name of ['ffmpeg', 'ffprobe', 'audiotee']) {
     const binPath = path.join(binDir, name);
     if (!fs.existsSync(binPath)) {
       console.warn(`[sign-ffmpeg] ${name} not found at ${binPath}, skipping.`);

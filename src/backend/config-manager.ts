@@ -33,6 +33,9 @@ export interface AppSettings {
   customTranscriptionPrompt: string;
   consensusEnabled: boolean;
   consensusMemoryEnabled: boolean;
+  meetingCaptureEnabled: boolean;
+  meetingNotesModel: string;
+  speakerLabels: Record<string, string>;
 }
 
 const DEFAULT_HOTKEY: HotkeySettings = {
@@ -50,7 +53,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   defaultProvider: 'gemini',
   defaultMode: 'gemini',
   autoDetectSpeakers: true,
-  language: 'auto',
+  language: 'en',
   punctuation: true,
   timestamps: true,
   summaryLength: 'medium',
@@ -65,6 +68,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   customTranscriptionPrompt: '',
   consensusEnabled: false,
   consensusMemoryEnabled: true,
+  meetingCaptureEnabled: false,
+  meetingNotesModel: 'gpt-5.2-2025-12-11',
+  speakerLabels: {},
 };
 
 export class ConfigManager {
@@ -94,6 +100,7 @@ export class ConfigManager {
       ...DEFAULT_SETTINGS,
       ...fromDisk,
       hotkey: this.sanitizeHotkey(fromDisk.hotkey),
+      speakerLabels: this.sanitizeSpeakerLabels(fromDisk.speakerLabels),
     };
 
     this.saveSettings(merged);
@@ -123,6 +130,24 @@ export class ConfigManager {
     };
   }
 
+  private sanitizeSpeakerLabels(labels?: Record<string, unknown>): Record<string, string> {
+    if (!labels || typeof labels !== 'object') {
+      return {};
+    }
+    const normalized: Record<string, string> = {};
+    for (const [rawKey, rawValue] of Object.entries(labels)) {
+      const key = String(rawKey || '')
+        .trim()
+        .toLowerCase();
+      const value = String(rawValue || '').trim();
+      if (!key || !value) {
+        continue;
+      }
+      normalized[key] = value;
+    }
+    return normalized;
+  }
+
   getSettings(): AppSettings {
     return JSON.parse(JSON.stringify(this.settings)) as AppSettings;
   }
@@ -134,6 +159,9 @@ export class ConfigManager {
     };
     if (partial.hotkey) {
       next.hotkey = this.sanitizeHotkey(partial.hotkey);
+    }
+    if (partial.speakerLabels) {
+      next.speakerLabels = this.sanitizeSpeakerLabels(partial.speakerLabels as unknown as Record<string, unknown>);
     }
     this.settings = next;
     this.saveSettings(this.settings);

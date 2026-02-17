@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;500&family=Source+Sans+3:wght@300;400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" type="text/css" href="static/style.css?v=20260117">
+    <link rel="stylesheet" type="text/css" href="static/style.css?v=20260216a">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.2/anime.min.js"></script>
 </head>
 <body>
@@ -78,7 +78,7 @@
                         <p class="recording-hint" id="recordingHint">Tap to capture and transcribe</p>
                     </div>
 
-                    <!-- Mode Selector -->
+                    <!-- Mode Selector (three-segment) -->
                     <div class="mode-selector">
                         <button class="mode-option" data-mode="gemini" title="Batch processing, more accurate">
                             <span class="mode-label">Accuracy</span>
@@ -86,8 +86,50 @@
                         <button class="mode-option active" data-mode="openai" title="Real-time streaming, faster">
                             <span class="mode-label">Live</span>
                         </button>
+                        <button class="mode-option" data-mode="meeting" title="Meeting capture with notes and diarization">
+                            <span class="mode-label">Meeting</span>
+                        </button>
+                    </div>
+
+                    <!-- Meeting mode banner -->
+                    <div class="meeting-banner" id="meetingBanner" style="display: none;">
+                        <span class="meeting-banner-text">System audio + mic will be recorded. Transcript saved to library.</span>
+                    </div>
+
+                    <!-- Automatic meeting detection prompt -->
+                    <div class="meeting-detect-prompt" id="meetingDetectPrompt" style="display: none;">
+                        <div class="meeting-detect-prompt-header">
+                            <p class="meeting-detect-prompt-title">Meeting detected</p>
+                            <button class="meeting-detect-close" id="meetingDetectClose" aria-label="Dismiss meeting suggestion">&times;</button>
+                        </div>
+                        <p class="meeting-detect-prompt-message" id="meetingDetectPromptMessage">
+                            Looks like a meeting is starting. Switch to Meeting Capture?
+                        </p>
+                        <label class="meeting-detect-prompt-checkbox">
+                            <input type="checkbox" id="meetingDetectDontAskAgain">
+                            <span>Don't ask again for this app</span>
+                        </label>
+                        <div class="meeting-detect-prompt-actions">
+                            <button class="meeting-detect-btn subtle" id="meetingDetectNotNowBtn">Not now</button>
+                            <button class="meeting-detect-btn primary" id="meetingDetectSwitchBtn">Switch to Meeting</button>
+                        </div>
                     </div>
                 </div>
+
+                <!-- Live meeting transcript panel -->
+                <section class="live-transcript-panel" id="liveTranscriptPanel" style="display: none;">
+                    <div class="live-transcript-panel-header">
+                        <button class="live-transcript-collapse" id="liveTranscriptCollapseBtn">
+                            <span class="live-transcript-collapse-label">Live Transcript</span>
+                            <span class="live-transcript-collapse-icon" id="liveTranscriptCollapseIcon">▾</span>
+                        </button>
+                        <label class="live-transcript-pin-toggle">
+                            <input type="checkbox" id="liveTranscriptPinToggle" checked>
+                            <span>Pin to bottom</span>
+                        </label>
+                    </div>
+                    <div class="live-transcript-panel-body scrollbar-minimal" id="liveTranscriptPanelBody"></div>
+                </section>
 
                 <!-- Featured Transcription with Polish Indicator (full-width) -->
                 <div class="featured-transcription-wrapper">
@@ -113,6 +155,8 @@
                         </div>
                     </div>
                 </div>
+
+                <div class="usage-stats" id="usageStats" style="display: none;"></div>
 
                 <!-- Recent Transcriptions -->
                 <div class="recent-section">
@@ -153,6 +197,13 @@
                     <p class="upload-zone-text">Drop files here or click to upload</p>
                     <p class="upload-zone-hint">MP3, WAV, M4A, FLAC up to 500MB</p>
                     <input type="file" id="libraryDropzoneFile" accept="audio/wav,audio/wave,audio/x-wav,audio/mpeg,audio/mp3,audio/ogg,audio/flac,audio/mp4,audio/x-m4a,.m4a" hidden>
+                </div>
+
+                <!-- Library Filter Pills -->
+                <div class="library-filters" id="libraryFilters">
+                    <button class="filter-pill active" data-filter="all">All</button>
+                    <button class="filter-pill" data-filter="dictation">Dictation</button>
+                    <button class="filter-pill" data-filter="meetings">Meetings</button>
                 </div>
 
                 <div class="library-list" id="libraryList">
@@ -219,6 +270,30 @@
                                     <div class="toggle-knob"></div>
                                 </div>
                             </div>
+                        </div>
+                    </section>
+
+                    <!-- Meeting Mode Settings -->
+                    <section class="settings-section">
+                        <h2 class="section-title">MEETING MODE</h2>
+
+                        <div class="settings-list">
+                            <div class="setting-toggle" data-setting="meetingCaptureEnabled">
+                                <div class="setting-info">
+                                    <p class="setting-label">Enable meeting capture mode</p>
+                                    <p class="setting-desc">Hotkey toggles continuous capture with live transcript, notes, and background diarization</p>
+                                </div>
+                                <div class="toggle-switch">
+                                    <div class="toggle-knob"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="setting-card">
+                            <label class="setting-select-label">Meeting notes model</label>
+                            <select id="meetingNotesModelSelect" class="setting-select">
+                                <option value="gpt-5.2-2025-12-11">GPT-5.2 (recommended)</option>
+                            </select>
                         </div>
                     </section>
 
@@ -444,7 +519,33 @@
     <!-- Toast Notification -->
     <div class="completion-toast" id="toast"></div>
 
-    <script src="static/main.js?v=20260122b" defer></script>
+    <template id="meetingShareActionsTemplate">
+        <button class="detail-action-btn" id="detailCopyMarkdownBtn" title="Copy meeting markdown">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="4" y="2" width="16" height="20" rx="2"></rect>
+                <line x1="8" y1="7" x2="16" y2="7"></line>
+                <line x1="8" y1="11" x2="16" y2="11"></line>
+                <line x1="8" y1="15" x2="13" y2="15"></line>
+            </svg>
+            <span>Copy Markdown</span>
+        </button>
+        <button class="detail-action-btn" id="detailShareEmailBtn" title="Share by email">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+                <polyline points="3 7 12 13 21 7"></polyline>
+            </svg>
+            <span>Email</span>
+        </button>
+        <button class="detail-action-btn" id="detailShareNotionBtn" title="Open in Notion">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                <path d="M8 16V8l7 8V8"></path>
+            </svg>
+            <span>Notion</span>
+        </button>
+    </template>
+
+    <script src="static/main.js?v=20260216a" defer></script>
 
 </body>
 </html>

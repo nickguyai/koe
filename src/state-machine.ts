@@ -1,11 +1,19 @@
 import { EventEmitter } from 'events';
 
-export type RecordingState = 'idle' | 'recording' | 'processing' | 'inserting' | 'error';
+export type RecordingState =
+  | 'idle'
+  | 'recording'
+  | 'processing'
+  | 'inserting'
+  | 'meeting_recording'
+  | 'meeting_processing'
+  | 'error';
 
 export type StateTrigger = 
   | 'hotkey_press' 
   | 'hotkey_release' 
   | 'transcription_complete' 
+  | 'notes_complete'
   | 'insertion_complete' 
   | 'error'
   | 'reset';
@@ -18,10 +26,9 @@ export interface StateTransition {
 
 // Valid state transitions
 const VALID_TRANSITIONS: Record<RecordingState, Partial<Record<StateTrigger, RecordingState>>> = {
-  idle: {
-    hotkey_press: 'recording',
-  },
+  idle: {},
   recording: {
+    hotkey_press: 'processing',
     hotkey_release: 'processing',
     error: 'idle',
   },
@@ -31,6 +38,14 @@ const VALID_TRANSITIONS: Record<RecordingState, Partial<Record<StateTrigger, Rec
   },
   inserting: {
     insertion_complete: 'idle',
+    error: 'idle',
+  },
+  meeting_recording: {
+    hotkey_press: 'meeting_processing',
+    error: 'idle',
+  },
+  meeting_processing: {
+    notes_complete: 'idle',
     error: 'idle',
   },
   error: {
@@ -47,6 +62,7 @@ export class RecordingStateMachine extends EventEmitter {
   private _currentState: RecordingState = 'idle';
   private _recordingStartTime: number | null = null;
   private _minRecordingDuration: number;
+  private _meetingModeEnabled: boolean = false;
 
   constructor(minRecordingDuration: number = 200) {
     super();
@@ -61,6 +77,14 @@ export class RecordingStateMachine extends EventEmitter {
     return this._recordingStartTime;
   }
 
+  get meetingModeEnabled(): boolean {
+    return this._meetingModeEnabled;
+  }
+
+  setMeetingMode(enabled: boolean): void {
+    this._meetingModeEnabled = Boolean(enabled);
+  }
+
   getRecordingDuration(): number {
     if (!this._recordingStartTime) return 0;
     return Date.now() - this._recordingStartTime;
@@ -71,26 +95,23 @@ export class RecordingStateMachine extends EventEmitter {
    * Returns true if transition was successful, false otherwise.
    */
   transition(trigger: StateTrigger): boolean {
-    const validTransitions = VALID_TRANSITIONS[this._currentState];
-    const nextState = validTransitions?.[trigger];
+    const nextState = this.getNextState(trigger);
 
     if (!nextState) {
       console.warn(`Invalid transition: ${this._currentState} + ${trigger}`);
       return false;
     }
 
-    // Special handling for hotkey_press -> recording
-    if (trigger === 'hotkey_press' && nextState === 'recording') {
+    // Start duration tracking when entering a recording state.
+    if (nextState === 'recording' || nextState === 'meeting_recording') {
       this._recordingStartTime = Date.now();
     }
 
-    // Special handling for hotkey_release -> processing
-    // Check minimum duration requirement
-    if (trigger === 'hotkey_release' && this._currentState === 'recording') {
+    // Check minimum duration only for standard push-to-talk recordings.
+    if ((trigger === 'hotkey_release' || trigger === 'hotkey_press') && this._currentState === 'recording') {
       const duration = this.getRecordingDuration();
       if (duration < this._minRecordingDuration) {
         console.log(`Recording too short (${duration}ms < ${this._minRecordingDuration}ms), ignoring`);
-        // Reset to idle without processing
         const previousState = this._currentState;
         this._currentState = 'idle';
         this._recordingStartTime = null;
@@ -101,11 +122,6 @@ export class RecordingStateMachine extends EventEmitter {
 
     const previousState = this._currentState;
     this._currentState = nextState;
-
-    // Clear recording start time when leaving recording state
-    if (previousState === 'recording' && nextState !== 'recording') {
-      // Keep the start time for duration calculation until we're done
-    }
 
     // Clear recording start time when returning to idle
     if (nextState === 'idle') {
@@ -134,8 +150,16 @@ export class RecordingStateMachine extends EventEmitter {
    * Check if a transition is valid without performing it
    */
   canTransition(trigger: StateTrigger): boolean {
+    return !!this.getNextState(trigger);
+  }
+
+  private getNextState(trigger: StateTrigger): RecordingState | undefined {
+    if (this._currentState === 'idle' && trigger === 'hotkey_press') {
+      return this._meetingModeEnabled ? 'meeting_recording' : 'recording';
+    }
+
     const validTransitions = VALID_TRANSITIONS[this._currentState];
-    return !!validTransitions?.[trigger];
+    return validTransitions?.[trigger];
   }
 }
 

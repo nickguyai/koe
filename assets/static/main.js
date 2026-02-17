@@ -54,8 +54,17 @@ let openAIListenerAttached = false;
 let liveSavedForSession = false;
 let liveMediaRecorder = null;
 let liveMediaRecorderChunks = [];
+let liveEarlyJobId = null;
 let liveRecordingStartTime = null;
 let liveRecordingEndTime = null;
+let liveMeetingModeActive = false;
+let liveMeetingSegments = [];
+let liveMeetingDisplaySegments = [];
+let liveMeetingTranscript = '';
+let liveTranscriptPinned = true;
+let liveTranscriptCollapsed = false;
+let pendingMeetingSuggestionApp = '';
+const activeDiarizationPollers = new Set();
 
 // App settings
 let settings = {
@@ -72,6 +81,9 @@ let settings = {
     customTranscriptionPrompt: '',
     consensusEnabled: false,
     consensusMemoryEnabled: true,
+    meetingCaptureEnabled: false,
+    meetingNotesModel: 'gpt-5.2-2025-12-11',
+    speakerLabels: {},
     hotkey: {
         code: 'Space',
         key: ' ',
@@ -324,6 +336,7 @@ const saveSettingsBtn = document.getElementById('saveSettings');
 const openaiKey = document.getElementById('openaiKey');
 const geminiKey = document.getElementById('geminiKey');
 const geminiModelSelect = document.getElementById('geminiModelSelect');
+const meetingNotesModelSelect = document.getElementById('meetingNotesModelSelect');
 const languageSelect = document.getElementById('languageSelect');
 const summaryOptions = document.querySelectorAll('.summary-option');
 const settingToggles = document.querySelectorAll('.setting-toggle');
@@ -344,6 +357,20 @@ const featuredCopyBtn = document.getElementById('featuredCopyBtn');
 
 // Mode Selector
 const modeOptions = document.querySelectorAll('.mode-option');
+
+// Meeting detection prompt
+const meetingDetectPrompt = document.getElementById('meetingDetectPrompt');
+const meetingDetectPromptMessage = document.getElementById('meetingDetectPromptMessage');
+const meetingDetectDontAskAgain = document.getElementById('meetingDetectDontAskAgain');
+const meetingDetectNotNowBtn = document.getElementById('meetingDetectNotNowBtn');
+const meetingDetectSwitchBtn = document.getElementById('meetingDetectSwitchBtn');
+const meetingDetectClose = document.getElementById('meetingDetectClose');
+
+// Live transcript panel
+const liveTranscriptPanel = document.getElementById('liveTranscriptPanel');
+const liveTranscriptPanelBody = document.getElementById('liveTranscriptPanelBody');
+const liveTranscriptCollapseBtn = document.getElementById('liveTranscriptCollapseBtn');
+const liveTranscriptPinToggle = document.getElementById('liveTranscriptPinToggle');
 
 // Polish Settings
 const polishStyleSelect = document.getElementById('polishStyleSelect');
@@ -405,6 +432,236 @@ async function copyToClipboard(text) {
 
 function isElectronEnvironment() {
     return typeof window.electronAPI !== 'undefined' || navigator.userAgent.includes('Electron');
+}
+
+async function syncMeetingModeToMainProcess() {
+    if (!window.electronAPI || !window.electronAPI.setMeetingMode) return;
+    try {
+        await window.electronAPI.setMeetingMode(!!settings.meetingCaptureEnabled);
+    } catch (e) {
+        console.warn('Failed to sync meeting mode to main process:', e);
+    }
+}
+
+function normalizeSpeakerKey(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, ' ');
+}
+
+function resolveSpeakerLabel(rawSpeakerName, fallbackName = 'Speaker') {
+    const key = normalizeSpeakerKey(rawSpeakerName);
+    if (key && settings.speakerLabels && settings.speakerLabels[key]) {
+        return settings.speakerLabels[key];
+    }
+    const raw = String(rawSpeakerName || '').trim();
+    return raw || fallbackName;
+}
+
+function applyModeSelection(mode, options = {}) {
+    const persist = options.persist !== false;
+    const syncMainProcess = options.syncMainProcess !== false;
+    const normalizedMode = mode === 'meeting' ? 'meeting' : (mode === 'openai' ? 'openai' : 'gemini');
+    const isMeeting = normalizedMode === 'meeting';
+
+    modeOptions.forEach(option => {
+        option.classList.toggle('active', option.dataset.mode === normalizedMode);
+    });
+
+    currentProvider = (normalizedMode === 'openai' || isMeeting) ? 'openai' : 'gemini';
+    settings.defaultMode = normalizedMode;
+    settings.meetingCaptureEnabled = isMeeting;
+
+    const settingsToggle = document.querySelector('[data-setting="meetingCaptureEnabled"] .toggle-switch');
+    if (settingsToggle) {
+        settingsToggle.classList.toggle('active', isMeeting);
+    }
+
+    const meetingBanner = document.getElementById('meetingBanner');
+    if (meetingBanner) {
+        meetingBanner.style.display = isMeeting ? 'block' : 'none';
+    }
+
+    document.body.classList.toggle('meeting-mode', isMeeting);
+    updateRecordingUI(isRecording);
+
+    if (!isMeeting) {
+        hideMeetingModeSuggestionPrompt();
+    }
+
+    if (persist) {
+        api.setSettings({
+            meetingCaptureEnabled: isMeeting,
+            defaultMode: normalizedMode
+        }).catch((e) => {
+            console.warn('Failed to persist mode selection:', e);
+        });
+    }
+
+    if (syncMainProcess) {
+        syncMeetingModeToMainProcess();
+    }
+}
+
+function renderLiveTranscriptEmptyState() {
+    if (!liveTranscriptPanelBody) return;
+    liveTranscriptPanelBody.innerHTML = '<p class="live-transcript-empty">Waiting for speech…</p>';
+}
+
+function resetLiveTranscriptPanel(options = {}) {
+    const hide = options.hide === true;
+    if (!liveTranscriptPanel) return;
+
+    if (hide) {
+        liveTranscriptPanel.style.display = 'none';
+        if (liveTranscriptPanelBody) {
+            liveTranscriptPanelBody.innerHTML = '';
+        }
+        return;
+    }
+
+    liveTranscriptPanel.style.display = 'block';
+    liveTranscriptPanel.classList.toggle('collapsed', liveTranscriptCollapsed);
+    renderLiveTranscriptEmptyState();
+}
+
+function appendLiveTranscriptRow(stamp, text) {
+    if (!liveTranscriptPanelBody || !liveTranscriptPanel) return;
+
+    if (liveTranscriptPanelBody.querySelector('.live-transcript-empty')) {
+        liveTranscriptPanelBody.innerHTML = '';
+    }
+
+    const row = document.createElement('div');
+    row.className = 'live-transcript-segment';
+    row.innerHTML = `
+        <span class="live-transcript-segment-time">${escapeHtml(stamp)}</span>
+        <p class="live-transcript-segment-text">${escapeHtml(text)}</p>
+    `;
+    liveTranscriptPanelBody.appendChild(row);
+
+    if (liveTranscriptPinned) {
+        liveTranscriptPanelBody.scrollTop = liveTranscriptPanelBody.scrollHeight;
+    }
+}
+
+function setupLiveTranscriptPanelListeners() {
+    if (liveTranscriptCollapseBtn) {
+        liveTranscriptCollapseBtn.addEventListener('click', () => {
+            liveTranscriptCollapsed = !liveTranscriptCollapsed;
+            if (liveTranscriptPanel) {
+                liveTranscriptPanel.classList.toggle('collapsed', liveTranscriptCollapsed);
+            }
+        });
+    }
+
+    if (liveTranscriptPinToggle) {
+        liveTranscriptPinToggle.checked = liveTranscriptPinned;
+        liveTranscriptPinToggle.addEventListener('change', () => {
+            liveTranscriptPinned = !!liveTranscriptPinToggle.checked;
+            if (liveTranscriptPinned && liveTranscriptPanelBody) {
+                liveTranscriptPanelBody.scrollTop = liveTranscriptPanelBody.scrollHeight;
+            }
+        });
+    }
+}
+
+function hideMeetingModeSuggestionPrompt() {
+    if (!meetingDetectPrompt) return;
+    meetingDetectPrompt.style.display = 'none';
+    pendingMeetingSuggestionApp = '';
+    if (meetingDetectDontAskAgain) {
+        meetingDetectDontAskAgain.checked = false;
+    }
+}
+
+function hasMeetingSuggestionBridge() {
+    return !!(window.electronAPI
+        && typeof window.electronAPI.dismissMeetingModeSuggestion === 'function'
+        && typeof window.electronAPI.switchMeetingModeSuggestion === 'function');
+}
+
+function showMeetingModeSuggestionPrompt(payload = {}) {
+    if (!hasMeetingSuggestionBridge()) {
+        console.warn('Meeting detection prompt is only available in the Electron app');
+        return;
+    }
+    if (!meetingDetectPrompt) return;
+    const appName = String(payload.appName || payload.processName || 'this app').trim();
+    pendingMeetingSuggestionApp = appName;
+    if (meetingDetectPromptMessage) {
+        meetingDetectPromptMessage.textContent = `Looks like a meeting is starting in ${appName}. Switch to Meeting Capture?`;
+    }
+    if (meetingDetectDontAskAgain) {
+        meetingDetectDontAskAgain.checked = false;
+    }
+    meetingDetectPrompt.style.display = 'block';
+}
+
+async function dismissMeetingModeSuggestionPrompt() {
+    const dontAskAgain = !!meetingDetectDontAskAgain?.checked;
+    if (!window.electronAPI || !window.electronAPI.dismissMeetingModeSuggestion) {
+        if (dontAskAgain) {
+            showToast('"Don\'t ask again" is only available in the desktop app');
+        }
+        hideMeetingModeSuggestionPrompt();
+        return;
+    }
+    try {
+        await window.electronAPI.dismissMeetingModeSuggestion({
+            appName: pendingMeetingSuggestionApp,
+            dontAskAgain
+        });
+    } catch (e) {
+        console.warn('Failed to dismiss meeting suggestion:', e);
+    } finally {
+        hideMeetingModeSuggestionPrompt();
+    }
+}
+
+async function switchMeetingModeFromSuggestion() {
+    const dontAskAgain = !!meetingDetectDontAskAgain?.checked;
+    const hasBridge = !!(window.electronAPI && window.electronAPI.switchMeetingModeSuggestion);
+    try {
+        if (hasBridge) {
+            await window.electronAPI.switchMeetingModeSuggestion({
+                appName: pendingMeetingSuggestionApp,
+                dontAskAgain
+            });
+        } else {
+            console.warn('Meeting mode suggestion bridge unavailable, applying local mode switch only');
+        }
+        applyModeSelection('meeting', { persist: true, syncMainProcess: false });
+        if (!hasBridge && dontAskAgain) {
+            showToast('Meeting mode enabled (desktop app required to save "Don\'t ask again")');
+        } else {
+            showToast('Meeting mode enabled');
+        }
+    } catch (e) {
+        console.warn('Failed to switch from meeting suggestion:', e);
+        showToast('Unable to switch meeting mode');
+    } finally {
+        hideMeetingModeSuggestionPrompt();
+    }
+}
+
+function setupMeetingDetectionPromptListeners() {
+    if (meetingDetectNotNowBtn) {
+        meetingDetectNotNowBtn.addEventListener('click', () => {
+            dismissMeetingModeSuggestionPrompt();
+        });
+    }
+    if (meetingDetectClose) {
+        meetingDetectClose.addEventListener('click', () => {
+            dismissMeetingModeSuggestionPrompt();
+        });
+    }
+    if (meetingDetectSwitchBtn) {
+        meetingDetectSwitchBtn.addEventListener('click', () => {
+            switchMeetingModeFromSuggestion();
+        });
+    }
 }
 
 function loadBuyMeCoffeeWidget() {
@@ -477,6 +734,12 @@ const api = {
         if (!response.ok) throw new Error('Failed to save settings');
         return response.json().catch(() => ({}));
     },
+    async rememberSpeakerLabel(speakerKey, label) {
+        if (window.electronAPI && window.electronAPI.rememberSpeakerLabel) {
+            return window.electronAPI.rememberSpeakerLabel({ speakerKey, label });
+        }
+        return null;
+    },
     async listJobs() {
         if (window.electronAPI && window.electronAPI.listTranscriptionJobs) {
             return window.electronAPI.listTranscriptionJobs();
@@ -525,6 +788,18 @@ const api = {
         }
         return null;
     },
+    async saveLiveAudio(payload) {
+        if (window.electronAPI && window.electronAPI.saveLiveAudio) {
+            return window.electronAPI.saveLiveAudio(payload);
+        }
+        return null;
+    },
+    async completeLiveAudioJob(payload) {
+        if (window.electronAPI && window.electronAPI.completeLiveAudioJob) {
+            return window.electronAPI.completeLiveAudioJob(payload);
+        }
+        return null;
+    },
     async polishJob(jobId) {
         if (window.electronAPI && window.electronAPI.polishTranscriptionJob) {
             return window.electronAPI.polishTranscriptionJob({ jobId });
@@ -536,6 +811,18 @@ const api = {
         });
         if (!response.ok) throw new Error('Polish failed');
         return response.json();
+    },
+    async retranscribeJob(jobId) {
+        if (window.electronAPI && window.electronAPI.retranscribeJob) {
+            return window.electronAPI.retranscribeJob(jobId);
+        }
+        const response = await fetch(`/api/v1/transcription_jobs/${jobId}/retranscribe`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+        });
+        if (!response.ok) throw new Error('Failed to queue re-transcription');
+        return response.json().catch(() => ({}));
     },
     async deleteJob(jobId) {
         if (window.electronAPI && window.electronAPI.deleteTranscriptionJob) {
@@ -554,6 +841,12 @@ const api = {
         const response = await fetch(`/api/v1/transcription_jobs/${jobId}/export`);
         if (!response.ok) throw new Error('Export failed');
         return response.json();
+    },
+    async shareMeetingToNotion(jobId) {
+        if (window.electronAPI && window.electronAPI.shareMeetingToNotion) {
+            return window.electronAPI.shareMeetingToNotion({ jobId });
+        }
+        return { ok: false, message: 'Notion sharing unavailable in web mode' };
     }
 };
 
@@ -657,32 +950,80 @@ function setupModeSelector() {
         option.addEventListener('click', () => {
             const mode = option.dataset.mode;
             if (!mode) return;
-
-            // Update UI
-            modeOptions.forEach(o => o.classList.remove('active'));
-            option.classList.add('active');
-
-            // Update provider
-            currentProvider = mode === 'openai' ? 'openai' : 'gemini';
-            console.log('Mode switched to:', currentProvider);
-
-            // Optionally persist to settings
-            updateModeSetting(mode);
+            applyModeSelection(mode, { persist: true, syncMainProcess: true });
         });
     });
-}
-
-async function updateModeSetting(mode) {
-    try {
-        await api.setSettings({ defaultMode: mode });
-    } catch (e) {
-        console.warn('Failed to update mode setting:', e);
-    }
 }
 
 // ============================================
 // Polish and Copy Functions
 // ============================================
+async function retranscribeJob(jobId) {
+    const confirmed = confirm('Re-transcribe this audio? The current transcription will be replaced.');
+    if (!confirmed) return;
+
+    const defaultBtnHtml = `
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <polyline points="1 4 1 10 7 10"></polyline>
+            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
+        </svg>
+        <span>Re-transcribe</span>
+    `;
+
+    try {
+        const btn = document.getElementById('detailRetranscribeBtn');
+        if (btn) {
+            btn.classList.add('loading');
+            btn.innerHTML = `
+                <svg class="spinner" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56"></path>
+                </svg>
+                <span>Queued...</span>
+            `;
+        }
+
+        await api.retranscribeJob(jobId);
+        showToast('Re-transcription queued');
+
+        const jobIndex = jobs.findIndex(j => j.id === jobId);
+        if (jobIndex >= 0) {
+            jobs[jobIndex].status = 'pending';
+            jobs[jobIndex].progress = 0;
+        } else {
+            jobs.unshift({
+                id: jobId,
+                name: selectedTranscription?.title || 'Untitled',
+                status: 'pending',
+                diarization_status: null,
+                progress: 0,
+                created_at: new Date().toISOString()
+            });
+        }
+        renderJobsList();
+        updateProcessingSection();
+        renderRecentTranscriptions();
+        renderLibrary();
+
+        switchView('library');
+        loadJobs();
+        pollJobUntilDone(jobId, {
+            sendToMain: false,
+            completionToast: 'Re-transcription complete'
+        });
+        loadFeaturedTranscription();
+    } catch (e) {
+        console.error('Retranscribe error:', e);
+        const errorMsg = e && e.message ? e.message : 'Failed to re-transcribe';
+        showToast(errorMsg);
+    } finally {
+        const btn = document.getElementById('detailRetranscribeBtn');
+        if (btn) {
+            btn.classList.remove('loading');
+            btn.innerHTML = defaultBtnHtml;
+        }
+    }
+}
+
 async function polishTranscript(jobId) {
     try {
         const polishBtn = document.getElementById('detailPolishBtn');
@@ -717,7 +1058,8 @@ async function polishTranscript(jobId) {
                     jobId,
                     detail.created_at,
                     detail.duration,
-                    detail.audio_path
+                    detail.audio_path,
+                    detail.diarization_status
                 );
                 const idx = transcriptions.findIndex(t => t.id === jobId);
                 if (idx >= 0) transcriptions[idx] = newTranscription;
@@ -807,6 +1149,85 @@ async function downloadTranscript(jobId) {
     } catch (e) {
         console.error('Download error:', e);
         showToast('Failed to download');
+    }
+}
+
+async function copyMeetingMarkdown(jobId) {
+    try {
+        const data = await api.exportJob(jobId);
+        if (!data?.markdown) {
+            showToast('No markdown export available');
+            return;
+        }
+        await navigator.clipboard.writeText(data.markdown);
+        showToast('Meeting markdown copied');
+    } catch (e) {
+        console.error('Copy markdown error:', e);
+        showToast('Failed to copy markdown');
+    }
+}
+
+async function shareMeetingByEmail(jobId) {
+    try {
+        const data = await api.exportJob(jobId);
+        if (!data?.markdown) {
+            showToast('No meeting notes to share');
+            return;
+        }
+        const subject = encodeURIComponent(`Meeting Notes: ${data.title || 'Untitled Meeting'}`);
+        const maxBodyLength = 6000;
+        const bodyText = data.markdown.length > maxBodyLength
+            ? `${data.markdown.slice(0, maxBodyLength)}\n\n[Message truncated. Open the app to view the full transcript.]`
+            : data.markdown;
+        const body = encodeURIComponent(bodyText);
+        const mailtoUrl = `mailto:?subject=${subject}&body=${body}`;
+        if (window.electronAPI?.openExternal) {
+            const opened = await window.electronAPI.openExternal(mailtoUrl);
+            if (!opened) {
+                window.location.href = mailtoUrl;
+            }
+        } else {
+            window.location.href = mailtoUrl;
+        }
+    } catch (e) {
+        console.error('Email share error:', e);
+        showToast('Failed to share by email');
+    }
+}
+
+async function shareMeetingToNotion(jobId) {
+    try {
+        const mcpResult = await api.shareMeetingToNotion(jobId);
+        if (mcpResult?.ok) {
+            if (mcpResult.pageUrl && window.electronAPI?.openExternal) {
+                await window.electronAPI.openExternal(mcpResult.pageUrl);
+            }
+            showToast('Shared to Notion');
+            return;
+        }
+
+        const data = await api.exportJob(jobId);
+        if (!data?.markdown) {
+            showToast('No meeting notes to share');
+            return;
+        }
+
+        // Fallback path when MCP is unavailable.
+        await navigator.clipboard.writeText(data.markdown);
+        const notionUrl = 'https://www.notion.so/new';
+        if (window.electronAPI?.openExternal) {
+            await window.electronAPI.openExternal(notionUrl);
+        } else {
+            window.open(notionUrl, '_blank');
+        }
+        if (mcpResult?.message) {
+            showToast(`Notion MCP unavailable: ${mcpResult.message}. Markdown copied.`);
+        } else {
+            showToast('✓ Markdown copied! Paste into the Notion page.');
+        }
+    } catch (e) {
+        console.error('Notion share error:', e);
+        showToast('Failed to share to Notion');
     }
 }
 
@@ -911,6 +1332,8 @@ function stopTimer() {
 }
 
 function updateRecordingUI(recording) {
+    const isMeeting = !!settings.meetingCaptureEnabled;
+
     if (recordButton) {
         recordButton.classList.toggle('recording', recording);
     }
@@ -919,21 +1342,35 @@ function updateRecordingUI(recording) {
 
     if (timer) timer.classList.toggle('active', recording);
     if (recordingLabel) {
-        recordingLabel.textContent = recording ? '' : 'Begin Recording';
-        recordingLabel.style.display = recording ? 'none' : 'block';
+        const idleLabel = isMeeting ? 'Start Meeting Capture' : 'Begin Recording';
+        recordingLabel.textContent = recording ? (isMeeting ? 'Capturing Meeting' : '') : idleLabel;
+        recordingLabel.style.display = recording && !isMeeting ? 'none' : 'block';
     }
     if (recordingHint) {
-        recordingHint.textContent = recording ? 'Recording in progress' : 'Tap to capture and transcribe';
+        if (recording) {
+            recordingHint.textContent = isMeeting ? 'System audio + mic recording' : 'Recording in progress';
+        } else {
+            recordingHint.textContent = isMeeting
+                ? 'Hotkey toggles start and stop for continuous meeting capture'
+                : 'Tap to capture and transcribe';
+        }
     }
 
     document.body.classList.toggle('is-recording', recording);
+    document.body.classList.toggle('meeting-mode', isMeeting);
 }
 
 async function startRecording() {
     if (isRecording) return;
 
+    // Clear any lingering meeting summary from previous session
+    dismissMeetingCaptureSummary();
+    hideMeetingModeSuggestionPrompt();
+
     try {
-        if (currentProvider === 'gemini') {
+        const isMeetingMode = !!settings.meetingCaptureEnabled;
+
+        if (currentProvider === 'gemini' && !isMeetingMode) {
             const geminiValue = (geminiKey?.value || '').trim();
             if (!geminiValue) {
                 showToast('Gemini API key is required');
@@ -949,6 +1386,16 @@ async function startRecording() {
 
         audioBuffer = new Int16Array(0);
         mediaRecorderChunks = [];
+
+        // Validate cached stream is still alive
+        if (streamInitialized && stream) {
+            const tracks = stream.getAudioTracks();
+            if (!tracks.length || tracks[0].readyState !== 'live') {
+                console.warn('Microphone stream ended, re-acquiring');
+                streamInitialized = false;
+                stream = null;
+            }
+        }
 
         if (!streamInitialized) {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -970,8 +1417,18 @@ async function startRecording() {
 
         isRecording = true;
         updateRecordingUI(true);
+        liveMeetingModeActive = isMeetingMode;
+        liveMeetingSegments = [];
+        liveMeetingDisplaySegments = [];
+        liveMeetingTranscript = '';
+        if (isMeetingMode) {
+            liveTranscriptCollapsed = false;
+            resetLiveTranscriptPanel({ hide: false });
+        } else {
+            resetLiveTranscriptPanel({ hide: true });
+        }
 
-        if (currentProvider === 'gemini') {
+        if (currentProvider === 'gemini' && !isMeetingMode) {
             console.log('Starting MediaRecorder for Gemini mode');
             mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
             mediaRecorder.ondataavailable = (e) => {
@@ -997,7 +1454,7 @@ async function startRecording() {
                 console.warn('Could not start live MediaRecorder:', err);
                 liveMediaRecorder = null;
             }
-            await initLiveSession();
+            await initLiveSession({ meetingMode: isMeetingMode });
         }
 
         startTimer();
@@ -1011,6 +1468,7 @@ async function startRecording() {
         liveMediaRecorder = null;
         liveMediaRecorderChunks = [];
         liveRecordingStartTime = null;
+        resetLiveTranscriptPanel({ hide: true });
         isRecording = false;
         updateRecordingUI(false);
         stopTimer();
@@ -1058,15 +1516,36 @@ async function stopRecording() {
         // Capture end timestamp now, before any async processing delay
         liveRecordingEndTime = Date.now();
 
+        // Persist raw audio immediately so it survives orchestration timeouts
+        if (liveMediaRecorderChunks.length > 0) {
+            try {
+                const blob = new Blob(liveMediaRecorderChunks, { type: 'audio/webm' });
+                const audioBytes = await blob.arrayBuffer();
+                const payload = { audioBytes };
+                if (liveRecordingStartTime) {
+                    const endTime = liveRecordingEndTime || Date.now();
+                    const elapsed = Math.round((endTime - liveRecordingStartTime) / 1000);
+                    payload.duration = formatDuration(elapsed);
+                }
+                const saved = await api.saveLiveAudio(payload);
+                if (saved && saved.id) {
+                    liveEarlyJobId = saved.id;
+                }
+            } catch (error) {
+                console.warn('Failed to persist live audio before transcription:', error);
+                liveEarlyJobId = null;
+            }
+        }
+
         // Flush residual audio from the worklet buffer before committing
         if (liveAudioWorklet) {
             const originalHandler = liveAudioWorklet.port.onmessage;
             await new Promise((resolve) => {
                 const timeout = setTimeout(() => {
-                    console.warn('AudioWorklet flush timed out after 500ms');
+                    console.warn('AudioWorklet flush timed out after 2000ms');
                     liveAudioWorklet.port.onmessage = originalHandler;
                     resolve();
-                }, 500);
+                }, 2000);
                 liveAudioWorklet.port.onmessage = (event) => {
                     if (event.data && event.data.flushed) {
                         clearTimeout(timeout);
@@ -1083,10 +1562,19 @@ async function stopRecording() {
         }
 
         // Brief pause to let in-flight IPC audio chunks arrive at the backend
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await new Promise((resolve) => setTimeout(resolve, 200));
 
+        let stopResult = null;
         if (window.electronAPI && window.electronAPI.openAIRealtimeStop) {
-            await window.electronAPI.openAIRealtimeStop();
+            stopResult = await window.electronAPI.openAIRealtimeStop({ meetingMode: liveMeetingModeActive });
+        }
+
+        if (liveMeetingModeActive) {
+            const transcriptFromStop = stopResult && typeof stopResult === 'object'
+                ? (stopResult.transcript || '')
+                : '';
+            const transcript = transcriptFromStop || liveMeetingTranscript || liveMeetingSegments.join('\n').trim();
+            await finalizeMeetingCapture(transcript);
         }
     }
 }
@@ -1109,6 +1597,11 @@ function resetRecordingState() {
         mediaRecorderChunks = [];
     }
 
+    liveMeetingModeActive = false;
+    liveMeetingSegments = [];
+    liveMeetingDisplaySegments = [];
+    liveMeetingTranscript = '';
+    resetLiveTranscriptPanel({ hide: true });
     cleanupLiveAudio();
 }
 
@@ -1125,19 +1618,21 @@ function ensureOpenAIListener() {
     openAIListenerAttached = true;
 }
 
-async function initLiveSession() {
+async function initLiveSession(options = {}) {
     if (!window.electronAPI || !window.electronAPI.openAIRealtimeStart) {
         throw new Error('Live mode requires the Electron backend');
     }
 
     liveSessionStarting = true;
     liveSavedForSession = false;
+    liveMeetingModeActive = !!options.meetingMode;
     ensureOpenAIListener();
 
     try {
-        await window.electronAPI.openAIRealtimeStart();
+        const startSessionPromise = window.electronAPI.openAIRealtimeStart({ meetingMode: liveMeetingModeActive });
+        const startAudioPromise = startAudioStreaming();
+        await Promise.all([startSessionPromise, startAudioPromise]);
         liveSessionActive = true;
-        await startAudioStreaming();
     } catch (error) {
         console.error('OpenAI session error:', error);
         const message = error && error.message ? error.message : 'Connection error';
@@ -1165,6 +1660,11 @@ async function startAudioStreaming() {
             throw new Error('Failed to create AudioContext');
         }
         liveAudioContext = audioCtx;
+        // AudioContext may start suspended when created outside a user gesture
+        // (e.g., triggered via IPC from a global hotkey)
+        if (audioCtx.state === 'suspended') {
+            await audioCtx.resume();
+        }
         console.log('AudioContext created, state:', audioCtx.state);
 
         liveSource = audioCtx.createMediaStreamSource(stream);
@@ -1201,12 +1701,18 @@ async function startAudioStreaming() {
 function handleLiveMessage(data) {
     console.log('Live message received:', data.type, 'isRecording:', isRecording, 'liveSessionStarting:', liveSessionStarting);
 
-    if (data.type === 'text') {
+    if (data.type === 'segment') {
+        if (liveMeetingModeActive) {
+            appendMeetingSegment(data.segment);
+        }
+    } else if (data.type === 'text') {
+        if (liveMeetingModeActive) {
+            // Meeting mode uses only segment events.
+            return;
+        }
         if (data.isNewResponse) {
-            // Final transcription received
             displayLiveTranscription(data.content);
         } else {
-            // Incremental transcription delta
             appendLiveTranscription(data.content);
         }
     } else if (data.type === 'status') {
@@ -1216,8 +1722,25 @@ function handleLiveMessage(data) {
             console.log('Ignoring status during active session');
             return;
         }
+        if (liveMeetingModeActive) {
+            return;
+        }
         if (data.status === 'completed') {
             cleanupLiveAudio();
+        }
+    } else if (data.type === 'system_audio_permission') {
+        if (data.status && data.status !== 'granted') {
+            showToast('System audio unavailable, continuing with microphone only');
+        }
+    } else if (data.type === 'system_audio_error') {
+        showToast(data.content || 'System audio capture error');
+    } else if (data.type === 'meeting_notes_ready') {
+        const jobId = data.jobId;
+        if (!jobId) return;
+        refreshJobFromBackend(jobId, true);
+    } else if (data.type === 'meeting_notes_failed') {
+        if (data.content) {
+            console.warn('Meeting notes generation failed:', data.content);
         }
     } else if (data.type === 'error') {
         console.error('Server error:', data.content);
@@ -1229,11 +1752,80 @@ function handleLiveMessage(data) {
     }
 }
 
-function displayLiveTranscription(text) {
+async function refreshJobFromBackend(jobId, showNotesToast = false) {
+    try {
+        const detail = await api.getJob(jobId);
+        if (!detail) return;
+
+        // Update jobs list even if there's no result yet (audio-only jobs)
+        const jobIndex = jobs.findIndex(j => j.id === jobId);
+        if (jobIndex >= 0) {
+            jobs[jobIndex] = {
+                ...jobs[jobIndex],
+                name: detail.title || jobs[jobIndex].name,
+                status: detail.status || jobs[jobIndex].status,
+                diarization_status: detail.diarization_status || jobs[jobIndex].diarization_status || null,
+            };
+        } else {
+            // Add audio-only job to jobs list so it appears in library for retry
+            jobs.unshift({
+                id: detail.id || jobId,
+                name: detail.title || 'Recording (retry pending)',
+                status: detail.status || 'pending',
+                diarization_status: detail.diarization_status || null,
+                progress: 0,
+                created_at: detail.created_at
+            });
+        }
+
+        // Only update transcriptions if we have a result
+        if (detail.result) {
+            const updated = resultToTranscription(
+                detail.result,
+                detail.id || jobId,
+                detail.created_at,
+                detail.duration,
+                detail.audio_path,
+                detail.diarization_status
+            );
+
+            const idx = transcriptions.findIndex(t => t.id === jobId);
+            if (idx >= 0) {
+                transcriptions[idx] = updated;
+            } else {
+                transcriptions.unshift(updated);
+            }
+
+            if (selectedTranscription && selectedTranscription.id === jobId) {
+                selectedTranscription = updated;
+                renderDetailView(updated);
+            }
+        }
+
+        renderJobsList();
+        updateProcessingSection();
+        renderRecentTranscriptions();
+        renderLibrary();
+
+        if (showNotesToast) {
+            showToast('Meeting notes ready');
+        }
+    } catch (e) {
+        console.warn('Failed to refresh job data:', e);
+    }
+}
+
+function displayLiveTranscription(text, options = {}) {
+    const {
+        autoComplete = true,
+        persist = true,
+        meetingMode = false
+    } = options;
+
     // Update featured transcription block with the result
     if (featuredTranscription && featuredContent) {
         featuredTranscription.style.display = 'block';
-        if (featuredTitle) featuredTitle.textContent = 'Live Transcription';
+        if (featuredTitle) featuredTitle.textContent = meetingMode ? 'Meeting Transcript' : 'Live Transcription';
         if (featuredDate) featuredDate.textContent = new Date().toLocaleDateString();
         featuredContent.textContent = text;
 
@@ -1243,37 +1835,151 @@ function displayLiveTranscription(text) {
             indicator.innerHTML = '<span class="polish-dot">◇</span><span class="polish-text">Raw transcript</span>';
         }
     }
-    showToast('Transcription complete');
+    showToast(meetingMode ? 'Meeting transcript complete' : 'Transcription complete');
 
-    if (window.electronAPI && text && text.trim()) {
+    if (autoComplete && window.electronAPI && text && text.trim()) {
         window.electronAPI.sendTranscriptionComplete(text);
-        persistLiveTranscription(text);
+    }
+    if (persist && text && text.trim()) {
+        persistLiveTranscription(text, { meetingMode });
     }
 }
 
-async function persistLiveTranscription(text) {
+function appendMeetingSegment(segment) {
+    const clean = String(segment || '').trim();
+    if (!clean) return;
+
+    const now = new Date();
+    const stamp = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    liveMeetingSegments.push(clean);
+    liveMeetingDisplaySegments.push(`[${stamp}] ${clean}`);
+    liveMeetingTranscript = liveMeetingSegments.join('\n');
+    appendLiveTranscriptRow(stamp, clean);
+
+    if (featuredTranscription && featuredContent) {
+        featuredTranscription.style.display = 'block';
+        if (featuredTitle) featuredTitle.textContent = 'Live Meeting Transcript';
+        if (featuredDate) featuredDate.textContent = new Date().toLocaleDateString();
+        featuredContent.textContent = liveMeetingDisplaySegments.join('\n');
+    }
+}
+
+function displayMeetingCaptureSummary(text) {
+    const preview = text.length > 300 ? text.slice(0, 300) + '...' : text;
+
+    // Remove any previous summary
+    const existing = document.getElementById('meetingSummary');
+    if (existing) existing.remove();
+
+    const summaryDiv = document.createElement('div');
+    summaryDiv.className = 'meeting-summary';
+    summaryDiv.id = 'meetingSummary';
+    summaryDiv.innerHTML = `
+        <h2 class="meeting-summary-title font-display">Meeting Capture Complete</h2>
+        <div class="meeting-summary-badges">
+            <span class="summary-badge">
+                <svg class="spinner-small" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>
+                Meeting notes
+            </span>
+            <span class="summary-badge">
+                <svg class="spinner-small" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>
+                Diarization
+            </span>
+        </div>
+        <div class="meeting-summary-preview">${escapeHtml(preview)}</div>
+        <button class="meeting-summary-cta" onclick="switchView('library')">
+            View full result in Library
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+        </button>
+    `;
+
+    // Insert after the featured-transcription-wrapper, preserving cached DOM refs
+    const featuredWrapper = document.querySelector('.featured-transcription-wrapper');
+    if (featuredWrapper) {
+        // Hide the original featured block while summary is visible
+        if (featuredTranscription) featuredTranscription.style.display = 'none';
+        featuredWrapper.after(summaryDiv);
+    }
+}
+
+function dismissMeetingCaptureSummary() {
+    const summary = document.getElementById('meetingSummary');
+    if (summary) summary.remove();
+}
+
+async function finalizeMeetingCapture(transcript) {
+    const text = String(transcript || '').trim();
+
+    if (!text) {
+        if (liveEarlyJobId) {
+            // Audio was saved — show it so user can retry transcription
+            showToast('No transcript detected. Recording saved for retry.');
+            refreshJobFromBackend(liveEarlyJobId);
+            cleanupLiveAudio();
+            if (window.electronAPI) {
+                window.electronAPI.sendTranscriptionComplete('');
+            }
+        } else {
+            cleanupLiveAudio();
+            showToast('No meeting transcript captured');
+            if (window.electronAPI) {
+                window.electronAPI.sendTranscriptionError('No meeting transcript captured');
+            }
+        }
+        liveMeetingModeActive = false;
+        return;
+    }
+
+    displayMeetingCaptureSummary(text);
+    await persistLiveTranscription(text, { meetingMode: true });
+    cleanupLiveAudio();
+
+    if (window.electronAPI) {
+        window.electronAPI.sendTranscriptionComplete(text);
+    }
+
+    liveMeetingModeActive = false;
+    liveMeetingDisplaySegments = [];
+}
+
+async function persistLiveTranscription(text, options = {}) {
     if (!text || !text.trim()) return;
     if (liveSavedForSession) return;
     liveSavedForSession = true;
+    const isMeetingMode = !!options.meetingMode;
 
     try {
-        // Build payload with optional audio bytes and duration
-        const payload = { text };
-        if (liveMediaRecorderChunks.length > 0) {
-            const blob = new Blob(liveMediaRecorderChunks, { type: 'audio/webm' });
-            const arrayBuf = await blob.arrayBuffer();
-            payload.audioBytes = arrayBuf;
+        let saved = null;
+        if (liveEarlyJobId) {
+            const payload = { jobId: liveEarlyJobId, text };
+            if (isMeetingMode) {
+                payload.meetingMode = true;
+            }
+            saved = await api.completeLiveAudioJob(payload);
+            liveEarlyJobId = null;
+        } else {
+            // Fallback path for sessions that were not pre-saved
+            const payload = { text };
+            if (liveMediaRecorderChunks.length > 0) {
+                const blob = new Blob(liveMediaRecorderChunks, { type: 'audio/webm' });
+                const arrayBuf = await blob.arrayBuffer();
+                payload.audioBytes = arrayBuf;
+            }
+            if (liveRecordingStartTime) {
+                const endTime = liveRecordingEndTime || Date.now();
+                const elapsed = Math.round((endTime - liveRecordingStartTime) / 1000);
+                payload.duration = formatDuration(elapsed);
+            }
+            if (isMeetingMode) {
+                payload.meetingMode = true;
+            }
+            saved = await api.saveLiveTranscription(payload);
         }
-        if (liveRecordingStartTime) {
-            const endTime = liveRecordingEndTime || Date.now();
-            const elapsed = Math.round((endTime - liveRecordingStartTime) / 1000);
-            payload.duration = formatDuration(elapsed);
-        }
+
         liveMediaRecorderChunks = [];
         liveRecordingStartTime = null;
         liveRecordingEndTime = null;
 
-        const saved = await api.saveLiveTranscription(payload);
         if (!saved || !saved.job) return;
 
         const job = saved.job;
@@ -1283,6 +1989,7 @@ async function persistLiveTranscription(text) {
             id: job.id,
             name: job.title || 'Live transcription',
             status: job.status,
+            diarization_status: job.diarization_status || null,
             progress: job.status === 'completed' ? 100 : 50,
             created_at: job.created_at
         });
@@ -1291,9 +1998,13 @@ async function persistLiveTranscription(text) {
 
         if (result) {
             currentJobId = job.id;
-            transcriptions.unshift(resultToTranscription(result, job.id, job.created_at, job.duration, job.audio_path));
+            transcriptions.unshift(resultToTranscription(result, job.id, job.created_at, job.duration, job.audio_path, job.diarization_status));
             renderRecentTranscriptions();
             renderLibrary();
+        }
+
+        if (job.diarization_status === 'pending' || job.diarization_status === 'processing') {
+            pollDiarizationUntilDone(job.id);
         }
     } catch (error) {
         liveSavedForSession = false;
@@ -1313,12 +2024,17 @@ function appendLiveTranscription(delta) {
 function cleanupLiveAudio() {
     liveSessionStarting = false;
     liveSessionActive = false;
+    liveMeetingModeActive = false;
+    liveMeetingSegments = [];
+    liveMeetingDisplaySegments = [];
+    liveMeetingTranscript = '';
     // Stop parallel MediaRecorder if still active
     if (liveMediaRecorder && liveMediaRecorder.state !== 'inactive') {
         liveMediaRecorder.stop();
     }
     liveMediaRecorder = null;
     liveMediaRecorderChunks = [];
+    liveEarlyJobId = null;
     liveRecordingStartTime = null;
     liveRecordingEndTime = null;
     if (liveAudioWorklet) {
@@ -1336,6 +2052,7 @@ function cleanupLiveAudio() {
     if (window.electronAPI && window.electronAPI.openAIRealtimeDisconnect) {
         window.electronAPI.openAIRealtimeDisconnect();
     }
+    resetLiveTranscriptPanel({ hide: true });
 }
 
 // ============================================
@@ -1374,6 +2091,7 @@ async function uploadAudioFile(file) {
             id: job.id,
             name: job.title || file.name,
             status: 'processing',
+            diarization_status: null,
             progress: 0,
             created_at: job.created_at
         });
@@ -1388,7 +2106,9 @@ async function uploadAudioFile(file) {
     }
 }
 
-async function pollJobUntilDone(jobId) {
+async function pollJobUntilDone(jobId, options = {}) {
+    const sendToMain = options.sendToMain !== false;
+    const completionToast = options.completionToast || 'Transcription complete';
     let status = 'pending';
     let latestDetail = null;
 
@@ -1402,10 +2122,13 @@ async function pollJobUntilDone(jobId) {
             const jobIndex = jobs.findIndex(j => j.id === jobId);
             if (jobIndex >= 0) {
                 jobs[jobIndex].status = status;
+                jobs[jobIndex].diarization_status = data.diarization_status || jobs[jobIndex].diarization_status || null;
                 jobs[jobIndex].progress = status === 'completed' ? 100 : (jobs[jobIndex].progress + 10) % 100;
             }
             renderJobsList();
             updateProcessingSection();
+            renderRecentTranscriptions();
+            renderLibrary();
 
             if (status === 'completed' || status === 'failed') break;
         } catch (e) {
@@ -1416,26 +2139,37 @@ async function pollJobUntilDone(jobId) {
 
     if (status === 'completed' && latestDetail?.result) {
         currentJobId = jobId;
-        // Add to transcriptions
+        // Upsert in transcriptions
         const newTranscription = resultToTranscription(
             latestDetail.result,
             jobId,
             latestDetail.created_at,
             latestDetail.duration,
-            latestDetail.audio_path
+            latestDetail.audio_path,
+            latestDetail.diarization_status
         );
-        transcriptions.unshift(newTranscription);
+        const idx = transcriptions.findIndex(t => t.id === jobId);
+        if (idx >= 0) {
+            transcriptions[idx] = newTranscription;
+        } else {
+            transcriptions.unshift(newTranscription);
+        }
         renderRecentTranscriptions();
-        showToast('Transcription complete');
+        renderLibrary();
+        showToast(completionToast);
         // Refresh featured transcription
         loadFeaturedTranscription();
 
         // Send to Electron main process for text insertion
-        if (window.electronAPI) {
+        if (sendToMain && window.electronAPI) {
             const text = latestDetail.result.speech_segments
                 ?.map(s => s.content)
                 .join(' ') || latestDetail.result.summary || '';
             window.electronAPI.sendTranscriptionComplete(text);
+        }
+
+        if (latestDetail.diarization_status === 'pending' || latestDetail.diarization_status === 'processing') {
+            pollDiarizationUntilDone(jobId);
         }
     }
 
@@ -1446,6 +2180,67 @@ async function pollJobUntilDone(jobId) {
             window.electronAPI.sendTranscriptionError(errorMessage);
         }
         showToast(errorMessage);
+    }
+}
+
+async function pollDiarizationUntilDone(jobId) {
+    // Prevent concurrent polling for the same job (avoids doubled API requests and duplicate toasts)
+    if (activeDiarizationPollers.has(jobId)) {
+        return;
+    }
+    activeDiarizationPollers.add(jobId);
+
+    let state = 'pending';
+    let attempts = 0;
+    try {
+        while ((state === 'pending' || state === 'processing') && attempts < 120) {
+            attempts += 1;
+            try {
+                const detail = await api.getJob(jobId);
+                state = detail.diarization_status || 'completed';
+                const jobIndex = jobs.findIndex(j => j.id === jobId);
+                if (jobIndex >= 0) {
+                    jobs[jobIndex].diarization_status = state;
+                    renderJobsList();
+                    updateProcessingSection();
+                }
+
+                if (state === 'completed' && detail.result) {
+                    const updated = resultToTranscription(
+                        detail.result,
+                        jobId,
+                        detail.created_at,
+                        detail.duration,
+                        detail.audio_path,
+                        detail.diarization_status
+                    );
+                    const idx = transcriptions.findIndex(t => t.id === jobId);
+                    if (idx >= 0) {
+                        transcriptions[idx] = updated;
+                    } else {
+                        transcriptions.unshift(updated);
+                    }
+                    if (selectedTranscription && selectedTranscription.id === jobId) {
+                        selectedTranscription = updated;
+                        renderDetailView(updated);
+                    }
+                    renderRecentTranscriptions();
+                    renderLibrary();
+                    showToast('Speaker diarization complete');
+                    return;
+                }
+
+                if (state === 'failed') {
+                    showToast('Diarization failed');
+                    return;
+                }
+            } catch (e) {
+                console.warn('Diarization polling error:', e);
+            }
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    } finally {
+        activeDiarizationPollers.delete(jobId);
     }
 }
 
@@ -1490,28 +2285,154 @@ function computeDurationFromSegments(segments) {
     return '0:00';
 }
 
-function resultToTranscription(result, jobId, createdAt, duration, audioPath) {
+function parseDurationToSeconds(val) {
+    if (val == null) return null;
+    // Number input
+    if (typeof val === 'number') return Number.isFinite(val) && val >= 0 ? val : null;
+    if (typeof val !== 'string') return null;
+    const str = val.trim();
+    if (!str) return null;
+    // ISO-8601: PT3M45S, PT1H2M3.5S
+    const iso = str.match(/^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/i);
+    if (iso && (iso[1] || iso[2] || iso[3])) {
+        return (parseFloat(iso[1] || '0') * 3600) + (parseFloat(iso[2] || '0') * 60) + parseFloat(iso[3] || '0');
+    }
+    // Colon format: hh:mm:ss or mm:ss (with optional fractional seconds)
+    const colonMatch = str.match(/^(\d+):(\d{1,2}(?:\.\d+)?)$/);
+    const colonMatch3 = str.match(/^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/);
+    if (colonMatch3) {
+        const s = parseFloat(colonMatch3[1]) * 3600 + parseFloat(colonMatch3[2]) * 60 + parseFloat(colonMatch3[3]);
+        return Number.isFinite(s) ? s : null;
+    }
+    if (colonMatch) {
+        const s = parseFloat(colonMatch[1]) * 60 + parseFloat(colonMatch[2]);
+        return Number.isFinite(s) ? s : null;
+    }
+    // Numeric string: "225", "225.5"
+    const num = parseFloat(str);
+    if (Number.isFinite(num) && num >= 0 && /^\d+(\.\d+)?$/.test(str)) return num;
+    return null;
+}
+
+function countWords(segments) {
+    let words = 0;
+    if (segments) {
+        for (const seg of segments) {
+            if (seg.text) words += seg.text.trim().split(/\s+/).filter(Boolean).length;
+        }
+    }
+    return words;
+}
+
+function resolveDuration(t) {
+    // Try saved duration first
+    let dur = parseDurationToSeconds(t.duration);
+    if (dur != null) return { seconds: dur, derived: false };
+    // Fallback: derive from segment timestamps
+    if (t.segments && t.segments.length > 0) {
+        const fallback = computeDurationFromSegments(t.segments);
+        dur = parseDurationToSeconds(fallback);
+        if (dur != null && dur > 0) return { seconds: dur, derived: true };
+    }
+    return { seconds: null, derived: false };
+}
+
+function computeUsageStats() {
+    let totalSeconds = 0;
+    let totalWords = 0;
+    let wordsWithDuration = 0;
+    let durationForWpm = 0;
+    let missingDurationWithWordsCount = 0;
+    let zeroDurationWithWordsCount = 0;
+    let derivedDurationCount = 0;
+    for (const t of transcriptions) {
+        const words = countWords(t.segments);
+        totalWords += words;
+        const { seconds, derived } = resolveDuration(t);
+        if (derived) derivedDurationCount++;
+        if (seconds != null) {
+            totalSeconds += seconds;
+            if (seconds > 0) {
+                wordsWithDuration += words;
+                durationForWpm += seconds;
+            } else if (words > 0) {
+                zeroDurationWithWordsCount++;
+            }
+        } else if (words > 0) {
+            missingDurationWithWordsCount++;
+        }
+    }
+    const wpm = durationForWpm > 0 ? Math.round(wordsWithDuration / (durationForWpm / 60)) : 0;
+    return {
+        totalSeconds, totalWords, wpm,
+        missingDurationWithWordsCount,
+        zeroDurationWithWordsCount,
+        derivedDurationCount
+    };
+}
+
+function renderUsageStats() {
+    const el = document.getElementById('usageStats');
+    if (!el) return;
+    if (!transcriptions || transcriptions.length === 0) {
+        el.style.display = 'none';
+        return;
+    }
+    const { totalSeconds, totalWords, wpm } = computeUsageStats();
+    const hours = Math.floor(totalSeconds / 3600);
+    const mins = Math.floor((totalSeconds % 3600) / 60);
+    const timeStr = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+    const wordsStr = totalWords.toLocaleString();
+    el.innerHTML = `
+        <div class="usage-stat">
+            <span class="usage-stat-value font-display">${timeStr}</span>
+            <span class="usage-stat-label">transcribed</span>
+        </div>
+        <div class="usage-stat-divider"></div>
+        <div class="usage-stat">
+            <span class="usage-stat-value font-display">${wordsStr}</span>
+            <span class="usage-stat-label">words</span>
+        </div>
+        <div class="usage-stat-divider"></div>
+        <div class="usage-stat">
+            <span class="usage-stat-value font-display">${wpm}</span>
+            <span class="usage-stat-label">wpm</span>
+        </div>`;
+    el.style.display = 'flex';
+}
+
+function resultToTranscription(result, jobId, createdAt, duration, audioPath, diarizationStatus) {
     const segments = result.speech_segments || [];
     const speakerColors = ['#4A4A4A', '#8B8B8B', '#A8A19A', '#6B7B5E', '#D4763A'];
 
     // Extract unique speaker names
     const uniqueSpeakers = segments
-        .map(s => s.speaker)
+        .map((s, index) => String(s.speaker || `Speaker ${index + 1}`).trim())
+        .filter(Boolean)
         .filter((name, index, arr) => arr.indexOf(name) === index)
         .slice(0, 5);
 
     // Build speaker objects with IDs and colors
-    const speakers = uniqueSpeakers.map((name, i) => ({
-        id: `s${i + 1}`,
-        name: name || `Speaker ${i + 1}`,
-        color: speakerColors[i % speakerColors.length]
-    }));
+    const speakers = uniqueSpeakers.map((rawName, i) => {
+        const fallback = `Speaker ${i + 1}`;
+        const resolvedRawName = rawName || fallback;
+        return {
+            id: `s${i + 1}`,
+            rawName: resolvedRawName,
+            speakerKey: normalizeSpeakerKey(resolvedRawName),
+            name: resolveSpeakerLabel(resolvedRawName, fallback),
+            color: speakerColors[i % speakerColors.length]
+        };
+    });
 
     // Map segments with speaker references
-    const mappedSegments = segments.map(s => {
-        const speakerIndex = uniqueSpeakers.indexOf(s.speaker);
+    const mappedSegments = segments.map((s, index) => {
+        const rawSpeaker = String(s.speaker || `Speaker ${index + 1}`).trim();
+        const speakerIndex = uniqueSpeakers.indexOf(rawSpeaker);
+        const safeIndex = speakerIndex >= 0 ? speakerIndex : 0;
         return {
-            speaker: `s${speakerIndex + 1}`,
+            speaker: `s${safeIndex + 1}`,
+            rawSpeaker,
             text: s.content || '',
             time: s.start_time || ''
         };
@@ -1532,8 +2453,11 @@ function resultToTranscription(result, jobId, createdAt, duration, audioPath) {
         speakers,
         briefing: result.summary || '',
         segments: mappedSegments,
+        isMeeting: !!result.is_meeting,
         readability: result.readability || null,
-        hasAudio: !!audioPath
+        hasAudio: !!audioPath,
+        meetingNotes: result.meeting_notes || null,
+        diarizationStatus: diarizationStatus || result.diarization_status || null
     };
 }
 
@@ -1587,9 +2511,20 @@ async function loadDetailAudio(jobId) {
 // ============================================
 // Rendering Functions
 // ============================================
+function isTranscriptionReprocessing(jobId) {
+    const job = jobs.find(j => j.id === jobId);
+    return !!job && (job.status === 'pending' || job.status === 'processing');
+}
+
 function renderTranscriptionCard(transcription, horizontal = false, delay = 0) {
     const title = escapeHtml(transcription.title);
     const briefing = escapeHtml(transcription.briefing);
+    const isReprocessing = isTranscriptionReprocessing(transcription.id);
+    const processingClass = isReprocessing ? ' is-processing' : '';
+    const isMeeting = !!transcription.isMeeting || !!transcription.meetingNotes;
+    const meetingClass = isMeeting ? ' meeting-card' : '';
+    const processingBadge = isReprocessing ? '<span class="transcription-card-badge">Re-transcribing...</span>' : '';
+    const meetingBadge = isMeeting ? '<span class="meeting-badge">Meeting</span>' : '';
     const speakersHtml = transcription.speakers.slice(0, 3).map((s, i) => {
         const colorClass = i === 0 ? 'gray' : i === 1 ? 'light' : 'stone';
         const initial = escapeHtml(s.name.charAt(0));
@@ -1600,10 +2535,10 @@ function renderTranscriptionCard(transcription, horizontal = false, delay = 0) {
 
     if (horizontal) {
         return `
-            <div class="transcription-card horizontal animate-float-up" data-id="${transcription.id}" style="${delayStyle}">
+            <div class="transcription-card horizontal animate-float-up${processingClass}${meetingClass}" data-id="${transcription.id}" data-type="${isMeeting ? 'meeting' : 'dictation'}" style="${delayStyle}">
                 <div class="transcription-card-content">
                     <div class="transcription-card-header">
-                        <h3 class="transcription-card-title">${title}</h3>
+                        <h3 class="transcription-card-title">${title}</h3>${meetingBadge}${processingBadge}
                     </div>
                     <p class="transcription-card-briefing">${briefing}</p>
                     <div class="transcription-card-meta">
@@ -1625,9 +2560,9 @@ function renderTranscriptionCard(transcription, horizontal = false, delay = 0) {
     }
 
     return `
-        <div class="transcription-card animate-float-up" data-id="${transcription.id}" style="${delayStyle}">
+        <div class="transcription-card animate-float-up${processingClass}${meetingClass}" data-id="${transcription.id}" data-type="${isMeeting ? 'meeting' : 'dictation'}" style="${delayStyle}">
             <div class="transcription-card-header">
-                <h3 class="transcription-card-title">${title}</h3>
+                <h3 class="transcription-card-title">${title}</h3>${meetingBadge}${processingBadge}
                 <span class="transcription-card-duration">${escapeHtml(transcription.duration)}</span>
             </div>
             <p class="transcription-card-briefing">${briefing}</p>
@@ -1651,22 +2586,52 @@ function renderRecentTranscriptions() {
     recentTranscriptions.querySelectorAll('.transcription-card').forEach(card => {
         card.addEventListener('click', () => {
             const id = card.dataset.id;
+            if (isTranscriptionReprocessing(id)) {
+                showToast('Re-transcription in progress');
+                return;
+            }
+            const transcription = transcriptions.find(t => t.id == id);
+            if (transcription) showTranscriptionDetail(transcription);
+        });
+    });
+
+    renderUsageStats();
+}
+
+let currentLibraryFilter = 'all';
+
+function renderLibrary() {
+    if (!libraryList) return;
+
+    const filtered = currentLibraryFilter === 'all' ? transcriptions
+        : currentLibraryFilter === 'meetings'
+            ? transcriptions.filter(t => !!t.isMeeting || !!t.meetingNotes)
+            : transcriptions.filter(t => !t.isMeeting && !t.meetingNotes);
+
+    libraryList.innerHTML = filtered.map((t, i) => renderTranscriptionCard(t, true, i * 0.05)).join('');
+
+    // Add click handlers
+    libraryList.querySelectorAll('.transcription-card').forEach(card => {
+        card.addEventListener('click', () => {
+            const id = card.dataset.id;
+            if (isTranscriptionReprocessing(id)) {
+                showToast('Re-transcription in progress');
+                return;
+            }
             const transcription = transcriptions.find(t => t.id == id);
             if (transcription) showTranscriptionDetail(transcription);
         });
     });
 }
 
-function renderLibrary() {
-    if (!libraryList) return;
-    libraryList.innerHTML = transcriptions.map((t, i) => renderTranscriptionCard(t, true, i * 0.05)).join('');
-
-    // Add click handlers
-    libraryList.querySelectorAll('.transcription-card').forEach(card => {
-        card.addEventListener('click', () => {
-            const id = card.dataset.id;
-            const transcription = transcriptions.find(t => t.id == id);
-            if (transcription) showTranscriptionDetail(transcription);
+function setupLibraryFilters() {
+    const filterPills = document.querySelectorAll('.filter-pill');
+    filterPills.forEach(pill => {
+        pill.addEventListener('click', () => {
+            filterPills.forEach(p => p.classList.remove('active'));
+            pill.classList.add('active');
+            currentLibraryFilter = pill.dataset.filter;
+            renderLibrary();
         });
     });
 }
@@ -1674,6 +2639,7 @@ function renderLibrary() {
 function renderJobItem(job, compact = false, delay = 0) {
     const isComplete = job.status === 'completed' || job.status === 'complete';
     const isFailed = job.status === 'failed';
+    const isDiarizing = isComplete && (job.diarization_status === 'pending' || job.diarization_status === 'processing');
     const isProcessing = !isComplete && !isFailed;
 
     let iconClass = '';
@@ -1681,16 +2647,22 @@ function renderJobItem(job, compact = false, delay = 0) {
     let badge = '';
     let statusText = '';
 
-    if (isComplete) {
+    if (isComplete && !isDiarizing) {
         iconClass = 'complete';
         icon = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
         badge = '<span class="job-badge">Complete</span>';
         statusText = 'Done';
+    } else if (isDiarizing) {
+        icon = `<svg class="spinner" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>`;
+        badge = '<span class="job-badge">Diarizing</span>';
+        statusText = 'Speakers...';
     } else if (isFailed) {
         iconClass = 'failed';
         icon = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>`;
-        badge = '<span class="job-badge failed">Failed</span>';
-        statusText = 'Failed';
+        badge = job.audio_path
+            ? '<span class="job-badge failed">Retry</span>'
+            : '<span class="job-badge failed">Failed</span>';
+        statusText = job.audio_path ? 'Click to retry' : 'Failed';
     } else {
         icon = `<svg class="spinner" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>`;
         statusText = `${job.progress || 0}%`;
@@ -1721,10 +2693,24 @@ function renderJobItem(job, compact = false, delay = 0) {
 function renderJobsList() {
     if (!jobsList) return;
     jobsList.innerHTML = jobs.map((job, i) => renderJobItem(job, false, i * 0.05)).join('');
+
+    // Add retry click handlers for failed jobs with audio
+    jobsList.querySelectorAll('.job-item').forEach(item => {
+        const id = item.dataset.id;
+        const job = jobs.find(j => j.id === id);
+        if (job && job.status === 'failed' && job.audio_path) {
+            item.style.cursor = 'pointer';
+            item.addEventListener('click', () => retranscribeJob(id));
+        }
+    });
 }
 
 function updateProcessingSection() {
-    const activeJobs = jobs.filter(j => j.status === 'processing' || j.status === 'pending');
+    const activeJobs = jobs.filter(
+        j => j.status === 'processing'
+            || j.status === 'pending'
+            || (j.status === 'completed' && (j.diarization_status === 'pending' || j.diarization_status === 'processing'))
+    );
     if (processingSection) {
         processingSection.style.display = activeJobs.length > 0 ? 'block' : 'none';
     }
@@ -1737,13 +2723,20 @@ function renderDetailView(transcription) {
     if (!detailView) return;
 
     cleanupDetailAudio();
+    const isMeetingTranscription = !!transcription.meetingNotes;
+    const meetingShareTemplate = document.getElementById('meetingShareActionsTemplate');
+    const meetingShareActionsHtml = isMeetingTranscription
+        ? (meetingShareTemplate ? meetingShareTemplate.innerHTML : '')
+        : '';
 
     const speakersHtml = transcription.speakers.map((speaker, i) => {
         const segmentCount = transcription.segments.filter(s => s.speaker === speaker.id).length;
         const speakerName = escapeHtml(speaker.name);
         const speakerInitial = escapeHtml(speaker.name.charAt(0));
+        const speakerKey = escapeHtml(speaker.speakerKey || normalizeSpeakerKey(speaker.rawName || speaker.name));
+        const rawSpeaker = escapeHtml(speaker.rawName || speaker.name);
         return `
-            <div class="speaker-item" data-speaker-id="${speaker.id}">
+            <div class="speaker-item" data-speaker-id="${speaker.id}" data-speaker-key="${speakerKey}" data-speaker-raw="${rawSpeaker}">
                 <div class="speaker-info">
                     <div class="speaker-avatar-large" style="background: ${speaker.color}10; color: ${speaker.color}">
                         ${speakerInitial}
@@ -1753,11 +2746,12 @@ function renderDetailView(transcription) {
                         <p class="speaker-segments">${segmentCount} segments</p>
                     </div>
                 </div>
-                <button class="speaker-edit-btn">
+                <button class="speaker-edit-btn" data-speaker-action="edit">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                         <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path>
                         <path d="m15 5 4 4"></path>
                     </svg>
+                    <span>Edit</span>
                 </button>
             </div>
         `;
@@ -1789,10 +2783,82 @@ function renderDetailView(transcription) {
 
     const title = escapeHtml(transcription.title);
     const briefing = escapeHtml(transcription.briefing);
+    const meetingNotes = transcription.meetingNotes;
+    const diarizationStatus = transcription.diarizationStatus;
+    const listHtml = (items) => {
+        if (!items || items.length === 0) {
+            return '<p class="briefing-text">No items available.</p>';
+        }
+        return `
+            <div class="key-points">
+                ${items.map((item) => `
+                    <div class="key-point">
+                        <div class="key-point-bullet"></div>
+                        <p class="key-point-text">${escapeHtml(item)}</p>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    };
+    const diarizationBadge = diarizationStatus === 'pending' || diarizationStatus === 'processing'
+        ? '<span class="job-badge">Diarizing speakers...</span>'
+        : '';
+
+    const meetingNotesHtml = meetingNotes ? `
+        <div class="briefing-section">
+            <h3 class="section-title">EXECUTIVE SUMMARY</h3>
+            <p class="briefing-text">${meetingNotes.summary ? escapeHtml(meetingNotes.summary) : briefing}</p>
+        </div>
+        <div class="briefing-divider"></div>
+        <div class="briefing-section">
+            <h3 class="section-title">DISCUSSION POINTS</h3>
+            ${listHtml(meetingNotes.discussion_points || [])}
+        </div>
+        <div class="briefing-divider"></div>
+        <div class="briefing-section">
+            <h3 class="section-title">ACTION ITEMS</h3>
+            ${listHtml(meetingNotes.action_items || [])}
+        </div>
+        <div class="briefing-divider"></div>
+        <div class="briefing-section">
+            <h3 class="section-title">DECISIONS</h3>
+            ${listHtml(meetingNotes.decisions || [])}
+        </div>
+        <div class="briefing-divider"></div>
+        <div class="briefing-section">
+            <h3 class="section-title">NEXT STEPS</h3>
+            ${listHtml(meetingNotes.next_steps || [])}
+        </div>
+    ` : `
+        <div class="briefing-section">
+            <h3 class="section-title">MEETING SUMMARY</h3>
+            <p class="briefing-text">${briefing}</p>
+        </div>
+        <div class="briefing-divider"></div>
+        <div class="briefing-section">
+            <h3 class="section-title">KEY POINTS</h3>
+            <div class="key-points">
+                <div class="key-point">
+                    <div class="key-point-bullet"></div>
+                    <p class="key-point-text">Meeting notes will appear here after generation.</p>
+                </div>
+            </div>
+        </div>
+    `;
+
     const audioHtml = transcription.hasAudio ? `
             <div class="detail-audio" id="detailAudioContainer">
                 <audio id="detailAudioPlayer" controls preload="metadata"></audio>
             </div>
+    ` : '';
+    const retranscribeButtonHtml = transcription.hasAudio ? `
+                    <button class="detail-action-btn retranscribe-btn" id="detailRetranscribeBtn" title="Re-transcribe audio">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <polyline points="1 4 1 10 7 10"></polyline>
+                            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
+                        </svg>
+                        <span>Re-transcribe</span>
+                    </button>
     ` : '';
 
     detailView.innerHTML = `
@@ -1811,9 +2877,11 @@ function renderDetailView(transcription) {
                         <span>${escapeHtml(transcription.date)}</span>
                         <span>•</span>
                         <span>${escapeHtml(transcription.duration)}</span>
+                        ${diarizationBadge}
                     </div>
                 </div>
                 <div class="detail-actions">
+                    ${retranscribeButtonHtml}
                     <button class="detail-action-btn polish-btn ${hasGeminiApiKey ? '' : 'disabled'}" id="detailPolishBtn" title="${hasGeminiApiKey ? 'Polish transcript' : 'Add Google API key in Settings to enable Polish'}">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                             <path d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z"></path>
@@ -1828,6 +2896,7 @@ function renderDetailView(transcription) {
                         </svg>
                         <span>Copy</span>
                     </button>
+                    ${meetingShareActionsHtml}
                     <button class="detail-action-btn" id="detailDownloadBtn" title="Download">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -1871,20 +2940,7 @@ function renderDetailView(transcription) {
 
             <div id="briefingTab" class="detail-tab-content" style="display: none;">
                 <div class="briefing-card">
-                    <div class="briefing-section">
-                        <h3 class="section-title">MEETING SUMMARY</h3>
-                        <p class="briefing-text">${briefing}</p>
-                    </div>
-                    <div class="briefing-divider"></div>
-                    <div class="briefing-section">
-                        <h3 class="section-title">KEY POINTS</h3>
-                        <div class="key-points">
-                            <div class="key-point">
-                                <div class="key-point-bullet"></div>
-                                <p class="key-point-text">Key insights from the discussion will appear here</p>
-                            </div>
-                        </div>
-                    </div>
+                    ${meetingNotesHtml}
                 </div>
             </div>
 
@@ -1911,6 +2967,14 @@ function setupDetailViewListeners() {
         });
     }
 
+    // Re-transcribe button
+    const retranscribeBtn = document.getElementById('detailRetranscribeBtn');
+    if (retranscribeBtn && selectedTranscription) {
+        retranscribeBtn.addEventListener('click', () => {
+            retranscribeJob(selectedTranscription.id);
+        });
+    }
+
     // Polish button
     const polishBtn = document.getElementById('detailPolishBtn');
     if (polishBtn && selectedTranscription) {
@@ -1924,6 +2988,27 @@ function setupDetailViewListeners() {
     if (copyBtn && selectedTranscription) {
         copyBtn.addEventListener('click', () => {
             copyTranscriptText(selectedTranscription.id);
+        });
+    }
+
+    const copyMarkdownBtn = document.getElementById('detailCopyMarkdownBtn');
+    if (copyMarkdownBtn && selectedTranscription) {
+        copyMarkdownBtn.addEventListener('click', () => {
+            copyMeetingMarkdown(selectedTranscription.id);
+        });
+    }
+
+    const shareEmailBtn = document.getElementById('detailShareEmailBtn');
+    if (shareEmailBtn && selectedTranscription) {
+        shareEmailBtn.addEventListener('click', () => {
+            shareMeetingByEmail(selectedTranscription.id);
+        });
+    }
+
+    const shareNotionBtn = document.getElementById('detailShareNotionBtn');
+    if (shareNotionBtn && selectedTranscription) {
+        shareNotionBtn.addEventListener('click', () => {
+            shareMeetingToNotion(selectedTranscription.id);
         });
     }
 
@@ -1955,6 +3040,101 @@ function setupDetailViewListeners() {
             document.getElementById('speakersTab').style.display = tabName === 'speakers' ? 'block' : 'none';
         });
     });
+
+    detailView.querySelectorAll('.speaker-edit-btn').forEach((button) => {
+        button.addEventListener('click', () => {
+            if (!selectedTranscription) return;
+            const speakerItem = button.closest('.speaker-item');
+            if (!speakerItem) return;
+
+            const speakerNameEl = speakerItem.querySelector('.speaker-name');
+            if (!speakerNameEl || speakerItem.querySelector('.speaker-name-input')) return;
+
+            const currentLabel = speakerNameEl.textContent || 'Speaker';
+
+            // Create inline input
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'speaker-name-input';
+            input.value = currentLabel;
+            input.placeholder = 'Enter name';
+
+            // Hide name, show input
+            speakerNameEl.style.display = 'none';
+            speakerNameEl.parentNode.insertBefore(input, speakerNameEl.nextSibling);
+            input.focus();
+            input.select();
+
+            // Hide edit button, show save/cancel
+            button.style.display = 'none';
+
+            const saveSpeakerLabel = async () => {
+                const trimmed = input.value.trim();
+                if (!trimmed || trimmed === currentLabel) {
+                    // Cancel - restore original state
+                    input.remove();
+                    speakerNameEl.style.display = '';
+                    button.style.display = '';
+                    return;
+                }
+
+                const speakerId = speakerItem.dataset.speakerId;
+                const speakerKey = normalizeSpeakerKey(speakerItem.dataset.speakerKey || speakerItem.dataset.speakerRaw || '');
+                if (!speakerId || !speakerKey) return;
+
+                const speaker = selectedTranscription.speakers.find((entry) => entry.id === speakerId);
+                if (!speaker) return;
+
+                speaker.name = trimmed;
+                settings.speakerLabels = settings.speakerLabels || {};
+                settings.speakerLabels[speakerKey] = trimmed;
+
+                try {
+                    if (window.electronAPI?.rememberSpeakerLabel) {
+                        await api.rememberSpeakerLabel(speakerKey, trimmed);
+                    } else {
+                        await api.setSettings({ speakerLabels: settings.speakerLabels });
+                    }
+                } catch (e) {
+                    console.warn('Failed to persist speaker label:', e);
+                    showToast('Unable to save speaker label');
+                }
+
+                const transIdx = transcriptions.findIndex(t => t.id === selectedTranscription.id);
+                if (transIdx >= 0) {
+                    transcriptions[transIdx] = selectedTranscription;
+                }
+                renderRecentTranscriptions();
+                renderLibrary();
+                renderDetailView(selectedTranscription);
+                const speakersTab = document.querySelector('.detail-tab[data-tab="speakers"]');
+                if (speakersTab) {
+                    speakersTab.dispatchEvent(new Event('click'));
+                }
+                showToast('Speaker label saved');
+            };
+
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    saveSpeakerLabel();
+                } else if (e.key === 'Escape') {
+                    input.remove();
+                    speakerNameEl.style.display = '';
+                    button.style.display = '';
+                }
+            });
+
+            input.addEventListener('blur', () => {
+                // Small delay to allow Enter key handler to fire first
+                setTimeout(() => {
+                    if (document.body.contains(input)) {
+                        saveSpeakerLabel();
+                    }
+                }, 100);
+            });
+        });
+    });
 }
 
 // ============================================
@@ -1968,8 +3148,10 @@ async function loadJobs() {
             id: job.id,
             name: job.title || 'Untitled',
             status: job.status,
+            diarization_status: job.diarization_status || null,
             progress: job.status === 'completed' ? 100 : 50,
-            created_at: job.created_at
+            created_at: job.created_at,
+            audio_path: job.audio_path || null
         }));
         renderJobsList();
         updateProcessingSection();
@@ -1978,20 +3160,31 @@ async function loadJobs() {
         for (const job of data.filter(j => j.status === 'completed')) {
             try {
                 const detail = await api.getJob(job.id);
-                if (detail.result && !transcriptions.find(t => t.id === job.id)) {
-                    transcriptions.push(resultToTranscription(
+                if (detail.result) {
+                    const mapped = resultToTranscription(
                         detail.result,
                         job.id,
                         job.created_at,
                         job.duration,
-                        job.audio_path || detail.audio_path
-                    ));
+                        job.audio_path || detail.audio_path,
+                        job.diarization_status || detail.diarization_status
+                    );
+                    const idx = transcriptions.findIndex(t => t.id === job.id);
+                    if (idx >= 0) {
+                        transcriptions[idx] = mapped;
+                    } else {
+                        transcriptions.push(mapped);
+                    }
+                }
+                if (detail.diarization_status === 'pending' || detail.diarization_status === 'processing') {
+                    pollDiarizationUntilDone(job.id);
                 }
             } catch (e) {
                 console.warn('Failed to load job detail:', e);
             }
         }
         renderRecentTranscriptions();
+        renderLibrary();
     } catch (e) {
         console.warn('Failed to load jobs:', e);
     }
@@ -2066,6 +3259,11 @@ function setupSettingsListeners() {
             }
             if (settingKey === 'autoPolish') {
                 savePolishSettings();
+            } else if (settingKey === 'meetingCaptureEnabled') {
+                const mode = settings.meetingCaptureEnabled
+                    ? 'meeting'
+                    : ((settings.defaultMode === 'openai' || currentProvider === 'openai') ? 'openai' : 'gemini');
+                applyModeSelection(mode, { persist: true, syncMainProcess: true });
             }
         });
     });
@@ -2116,6 +3314,13 @@ function setupSettingsListeners() {
         geminiModelSelect.addEventListener('change', () => {
             settings.geminiModel = geminiModelSelect.value;
             api.setSettings({ geminiModel: settings.geminiModel });
+        });
+    }
+
+    if (meetingNotesModelSelect) {
+        meetingNotesModelSelect.addEventListener('change', () => {
+            settings.meetingNotesModel = meetingNotesModelSelect.value;
+            api.setSettings({ meetingNotesModel: settings.meetingNotesModel });
         });
     }
 
@@ -2348,6 +3553,8 @@ async function saveSettings() {
         defaultProvider: settings.defaultMode,
         geminiModel: settings.geminiModel,
         customTranscriptionPrompt: settings.customTranscriptionPrompt,
+        meetingCaptureEnabled: settings.meetingCaptureEnabled,
+        meetingNotesModel: settings.meetingNotesModel,
         hotkey: settings.hotkey,
         ...settings
     };
@@ -2361,6 +3568,8 @@ async function saveSettings() {
             const accelerator = hotkeyToAccelerator(settings.hotkey);
             await window.electronAPI.updateHotkey(accelerator);
         }
+        await syncMeetingModeToMainProcess();
+        updateRecordingUI(isRecording);
     } catch (error) {
         console.error('Settings save error:', error);
         showToast('Error saving settings');
@@ -2482,6 +3691,15 @@ async function loadSettings() {
         // Load consensus settings
         settings.consensusEnabled = data.consensusEnabled || false;
         settings.consensusMemoryEnabled = data.consensusMemoryEnabled !== false;
+        settings.meetingCaptureEnabled = data.meetingCaptureEnabled || false;
+        settings.meetingNotesModel = data.meetingNotesModel || 'gpt-5.2-2025-12-11';
+        settings.speakerLabels = data.speakerLabels || {};
+
+        // Sync main-page meeting toggle
+        const mainMeetingToggle = document.getElementById('meetingToggleSwitch');
+        if (mainMeetingToggle) {
+            mainMeetingToggle.classList.toggle('active', !!settings.meetingCaptureEnabled);
+        }
 
         // Apply toggle settings to UI
         settingToggles.forEach(toggle => {
@@ -2510,16 +3728,17 @@ async function loadSettings() {
             customPolishPrompt.value = settings.customPolishPrompt;
         }
 
-        // Apply mode to mode selector
-        currentProvider = settings.defaultMode === 'openai' ? 'openai' : 'gemini';
-        modeOptions.forEach(opt => {
-            opt.classList.toggle('active', opt.dataset.mode === settings.defaultMode);
-        });
+        // Apply mode selection without persisting again
+        const initialMode = settings.defaultMode || (settings.meetingCaptureEnabled ? 'meeting' : 'gemini');
+        applyModeSelection(initialMode, { persist: false, syncMainProcess: false });
 
         // Apply Gemini model setting
         settings.geminiModel = data.geminiModel || 'gemini-3-flash-preview';
         if (geminiModelSelect) {
             geminiModelSelect.value = settings.geminiModel;
+        }
+        if (meetingNotesModelSelect) {
+            meetingNotesModelSelect.value = settings.meetingNotesModel;
         }
 
         // Apply custom transcription prompt
@@ -2549,6 +3768,8 @@ async function loadSettings() {
             settings.hotkey = data.hotkey;
         }
         updateHotkeyDisplay();
+        updateRecordingUI(isRecording);
+        syncMeetingModeToMainProcess();
     } catch (error) {
         console.error('Settings load error:', error);
     }
@@ -2657,6 +3878,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Settings
     setupSettingsListeners();
+    setupMeetingDetectionPromptListeners();
+    setupLiveTranscriptPanelListeners();
     loadSettings();
 
     // Dropzone
@@ -2671,6 +3894,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Mode selector
     setupModeSelector();
+
+    // Library filter pills
+    setupLibraryFilters();
 
     // Initial render
     renderRecentTranscriptions();
@@ -2708,6 +3934,23 @@ document.addEventListener('DOMContentLoaded', () => {
         console.log('Electron: Reset recording state received');
         resetRecordingState();
     });
+
+    if (window.electronAPI.onMeetingModeSuggestion) {
+        window.electronAPI.onMeetingModeSuggestion((payload) => {
+            if (isRecording || settings.meetingCaptureEnabled) {
+                return;
+            }
+            showMeetingModeSuggestionPrompt(payload || {});
+        });
+    }
+
+    if (window.electronAPI.onMeetingModeUpdated) {
+        window.electronAPI.onMeetingModeUpdated((payload) => {
+            if (payload && payload.enabled === true) {
+                applyModeSelection('meeting', { persist: true, syncMainProcess: false });
+            }
+        });
+    }
 
     console.log('Electron IPC bridge initialized');
 })();

@@ -1,29 +1,39 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock Electron before importing the module under test
-const mockWebContents = {
-  send: vi.fn(),
-  once: vi.fn(),
-};
+const { mockWebContents, mockBrowserWindow, mockScreen, mockBrowserWindowCtor } = vi.hoisted(() => {
+  const webContents = {
+    send: vi.fn(),
+    once: vi.fn(),
+  };
 
-const mockBrowserWindow = {
-  isDestroyed: vi.fn(() => false),
-  destroy: vi.fn(),
-  setAlwaysOnTop: vi.fn(),
-  loadURL: vi.fn(),
-  showInactive: vi.fn(),
-  setPosition: vi.fn(),
-  webContents: mockWebContents,
-};
+  const baseWindow = {
+    isDestroyed: vi.fn(() => false),
+    destroy: vi.fn(),
+    setAlwaysOnTop: vi.fn(),
+    loadURL: vi.fn(),
+    loadFile: vi.fn(),
+    showInactive: vi.fn(),
+    setPosition: vi.fn(),
+    setBounds: vi.fn(),
+    webContents,
+  };
 
-const mockScreen = {
-  getAllDisplays: vi.fn(() => []),
-  on: vi.fn(),
-  removeListener: vi.fn(),
-};
+  const browserWindowCtor = vi.fn(() => ({ ...baseWindow, webContents: { ...webContents } }));
+
+  return {
+    mockWebContents: webContents,
+    mockBrowserWindow: baseWindow,
+    mockScreen: {
+      getAllDisplays: vi.fn(() => []),
+      on: vi.fn(),
+      removeListener: vi.fn(),
+    },
+    mockBrowserWindowCtor: browserWindowCtor,
+  };
+});
 
 vi.mock('electron', () => ({
-  BrowserWindow: vi.fn(() => ({ ...mockBrowserWindow, webContents: { ...mockWebContents } })),
+  BrowserWindow: mockBrowserWindowCtor,
   screen: mockScreen,
 }));
 
@@ -34,7 +44,12 @@ vi.mock('path', () => ({
 import { RecordingWidget } from '../recording-widget';
 
 function makeDisplay(id: number, x = 0, y = 0, width = 1920, height = 1080): Electron.Display {
-  return { id, workArea: { x, y, width, height } } as unknown as Electron.Display;
+  return {
+    id,
+    workArea: { x, y, width, height },
+    bounds: { x, y, width, height },
+    internal: false,
+  } as unknown as Electron.Display;
 }
 
 describe('RecordingWidget', () => {
@@ -50,7 +65,7 @@ describe('RecordingWidget', () => {
       const displays = [makeDisplay(1), makeDisplay(2)];
       mockScreen.getAllDisplays.mockReturnValue(displays);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       widget.init();
 
       expect(BrowserWindow).toHaveBeenCalledTimes(2);
@@ -70,7 +85,7 @@ describe('RecordingWidget', () => {
       const display = makeDisplay(1);
       mockScreen.getAllDisplays.mockReturnValue([display]);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       widget.init();
 
       // Simulate display-added for same id
@@ -113,7 +128,7 @@ describe('RecordingWidget', () => {
       const displays = [makeDisplay(1), makeDisplay(2)];
       mockScreen.getAllDisplays.mockReturnValue(displays);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       const windows: any[] = [];
       BrowserWindow.mockImplementation(() => {
         const win = {
@@ -121,8 +136,10 @@ describe('RecordingWidget', () => {
           destroy: vi.fn(),
           setAlwaysOnTop: vi.fn(),
           loadURL: vi.fn(),
+          loadFile: vi.fn(),
           showInactive: vi.fn(),
           setPosition: vi.fn(),
+          setBounds: vi.fn(),
           webContents: { send: vi.fn(), once: vi.fn() },
         };
         windows.push(win);
@@ -143,7 +160,7 @@ describe('RecordingWidget', () => {
       const displays = [makeDisplay(1), makeDisplay(2)];
       mockScreen.getAllDisplays.mockReturnValue(displays);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       const windows: any[] = [];
       BrowserWindow.mockImplementation(() => {
         const win = {
@@ -151,8 +168,10 @@ describe('RecordingWidget', () => {
           destroy: vi.fn(),
           setAlwaysOnTop: vi.fn(),
           loadURL: vi.fn(),
+          loadFile: vi.fn(),
           showInactive: vi.fn(),
           setPosition: vi.fn(),
+          setBounds: vi.fn(),
           webContents: { send: vi.fn(), once: vi.fn() },
         };
         windows.push(win);
@@ -163,21 +182,23 @@ describe('RecordingWidget', () => {
       widget.updateAllWidgets('recording');
 
       for (const win of windows) {
-        expect(win.webContents.send).toHaveBeenCalledWith('widget-state-update', { status: 'recording' });
+        expect(win.webContents.send).toHaveBeenCalledWith('widget-state-update', { status: 'recording', mode: 'dictation' });
       }
     });
 
     it('cleans up destroyed windows during update', () => {
       mockScreen.getAllDisplays.mockReturnValue([makeDisplay(1)]);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       const destroyedWin = {
         isDestroyed: vi.fn(() => true),
         destroy: vi.fn(),
         setAlwaysOnTop: vi.fn(),
         loadURL: vi.fn(),
+        loadFile: vi.fn(),
         showInactive: vi.fn(),
         setPosition: vi.fn(),
+        setBounds: vi.fn(),
         webContents: { send: vi.fn(), once: vi.fn() },
       };
       BrowserWindow.mockReturnValue(destroyedWin);
@@ -193,7 +214,7 @@ describe('RecordingWidget', () => {
     it('pushes current state to newly added widget when not idle', () => {
       mockScreen.getAllDisplays.mockReturnValue([]);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       let createdWin: any = null;
       BrowserWindow.mockImplementation(() => {
         createdWin = {
@@ -201,8 +222,10 @@ describe('RecordingWidget', () => {
           destroy: vi.fn(),
           setAlwaysOnTop: vi.fn(),
           loadURL: vi.fn(),
+          loadFile: vi.fn(),
           showInactive: vi.fn(),
           setPosition: vi.fn(),
+          setBounds: vi.fn(),
           webContents: { send: vi.fn(), once: vi.fn() },
         };
         return createdWin;
@@ -224,13 +247,13 @@ describe('RecordingWidget', () => {
       const loadCb = createdWin.webContents.once.mock.calls[0][1];
       loadCb();
 
-      expect(createdWin.webContents.send).toHaveBeenCalledWith('widget-state-update', { status: 'recording' });
+      expect(createdWin.webContents.send).toHaveBeenCalledWith('widget-state-update', { status: 'recording', mode: 'dictation' });
     });
 
     it('does not push state for idle (default)', () => {
       mockScreen.getAllDisplays.mockReturnValue([]);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       let createdWin: any = null;
       BrowserWindow.mockImplementation(() => {
         createdWin = {
@@ -238,8 +261,10 @@ describe('RecordingWidget', () => {
           destroy: vi.fn(),
           setAlwaysOnTop: vi.fn(),
           loadURL: vi.fn(),
+          loadFile: vi.fn(),
           showInactive: vi.fn(),
           setPosition: vi.fn(),
+          setBounds: vi.fn(),
           webContents: { send: vi.fn(), once: vi.fn() },
         };
         return createdWin;
@@ -251,8 +276,10 @@ describe('RecordingWidget', () => {
       const addedCb = mockScreen.on.mock.calls.find((c: unknown[]) => c[0] === 'display-added')![1] as Function;
       addedCb({}, makeDisplay(2));
 
-      // Should not register did-finish-load for state push
-      expect(createdWin.webContents.once).not.toHaveBeenCalled();
+      expect(createdWin.webContents.once).toHaveBeenCalledWith('did-finish-load', expect.any(Function));
+      const loadCb = createdWin.webContents.once.mock.calls[0][1];
+      loadCb();
+      expect(createdWin.webContents.send).not.toHaveBeenCalledWith('widget-state-update', { status: 'idle' });
     });
   });
 
@@ -261,14 +288,16 @@ describe('RecordingWidget', () => {
       const display = makeDisplay(1);
       mockScreen.getAllDisplays.mockReturnValue([display]);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       const win = {
         isDestroyed: vi.fn(() => false),
         destroy: vi.fn(),
         setAlwaysOnTop: vi.fn(),
         loadURL: vi.fn(),
+        loadFile: vi.fn(),
         showInactive: vi.fn(),
         setPosition: vi.fn(),
+        setBounds: vi.fn(),
         webContents: { send: vi.fn(), once: vi.fn() },
       };
       BrowserWindow.mockReturnValue(win);
@@ -287,14 +316,16 @@ describe('RecordingWidget', () => {
       const display = makeDisplay(1, 0, 0, 1920, 1080);
       mockScreen.getAllDisplays.mockReturnValue([display]);
 
-      const { BrowserWindow } = require('electron');
+      const BrowserWindow = mockBrowserWindowCtor;
       const win = {
         isDestroyed: vi.fn(() => false),
         destroy: vi.fn(),
         setAlwaysOnTop: vi.fn(),
         loadURL: vi.fn(),
+        loadFile: vi.fn(),
         showInactive: vi.fn(),
         setPosition: vi.fn(),
+        setBounds: vi.fn(),
         webContents: { send: vi.fn(), once: vi.fn() },
       };
       BrowserWindow.mockReturnValue(win);

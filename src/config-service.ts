@@ -9,6 +9,8 @@ export interface AppConfig {
   insertionMethod: 'paste' | 'clipboard_only';
   showFloatingIndicator: boolean;
   minRecordingDuration: number;  // ms, default 200
+  meetingDetectionEnabled: boolean;
+  meetingPromptDismissedApps: Record<string, boolean>;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -16,6 +18,8 @@ const DEFAULT_CONFIG: AppConfig = {
   insertionMethod: 'paste',
   showFloatingIndicator: true,
   minRecordingDuration: 200,
+  meetingDetectionEnabled: false,
+  meetingPromptDismissedApps: {},
 };
 
 export class ConfigService {
@@ -50,6 +54,8 @@ export class ConfigService {
       insertionMethod: this.store.get('insertionMethod', DEFAULT_CONFIG.insertionMethod),
       showFloatingIndicator: this.store.get('showFloatingIndicator', DEFAULT_CONFIG.showFloatingIndicator),
       minRecordingDuration: this.store.get('minRecordingDuration', DEFAULT_CONFIG.minRecordingDuration),
+      meetingDetectionEnabled: this.getMeetingDetectionEnabled(),
+      meetingPromptDismissedApps: this.getMeetingPromptDismissedApps(),
     };
   }
 
@@ -68,6 +74,12 @@ export class ConfigService {
     }
     if (config.minRecordingDuration !== undefined) {
       this.store.set('minRecordingDuration', config.minRecordingDuration);
+    }
+    if (config.meetingDetectionEnabled !== undefined) {
+      this.store.set('meetingDetectionEnabled', Boolean(config.meetingDetectionEnabled));
+    }
+    if (config.meetingPromptDismissedApps !== undefined) {
+      this.store.set('meetingPromptDismissedApps', config.meetingPromptDismissedApps);
     }
   }
 
@@ -130,6 +142,48 @@ export class ConfigService {
    */
   setShowFloatingIndicator(show: boolean): void {
     this.store.set('showFloatingIndicator', show);
+  }
+
+  getMeetingDetectionEnabled(): boolean {
+    return this.store.get('meetingDetectionEnabled', DEFAULT_CONFIG.meetingDetectionEnabled);
+  }
+
+  setMeetingDetectionEnabled(enabled: boolean): void {
+    this.store.set('meetingDetectionEnabled', Boolean(enabled));
+  }
+
+  getMeetingPromptDismissedApps(): Record<string, boolean> {
+    return { ...(this.store.get('meetingPromptDismissedApps', DEFAULT_CONFIG.meetingPromptDismissedApps) || {}) };
+  }
+
+  shouldPromptForMeetingApp(appName: string): boolean {
+    const key = this.normalizeMeetingAppName(appName);
+    if (!key) {
+      return false;
+    }
+    const dismissed = this.getMeetingPromptDismissedApps();
+    return dismissed[key] !== true;
+  }
+
+  setMeetingPromptDismissedForApp(appName: string, dismissed: boolean): void {
+    const key = this.normalizeMeetingAppName(appName);
+    if (!key) {
+      return;
+    }
+    const next = this.getMeetingPromptDismissedApps();
+    if (dismissed) {
+      next[key] = true;
+    } else {
+      delete next[key];
+    }
+    this.store.set('meetingPromptDismissedApps', next);
+  }
+
+  private normalizeMeetingAppName(appName: string): string {
+    return String(appName || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
   }
 
   /**

@@ -4,7 +4,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import { ConfigManager } from './config-manager';
 import { getFfmpegPath } from './ffmpeg-paths';
-import { buildTranscriptionPrompt, buildChunkTranscriptionPrompt, buildPolishPrompt } from './prompts';
+import { buildTranscriptionPrompt, buildChunkTranscriptionPrompt, buildPolishPrompt, LIVE_TRANSCRIPTION_PROMPT } from './prompts';
 import { splitAudio, cleanupChunks, AudioChunk } from './audio-chunker';
 
 export interface SpeechSegment {
@@ -14,20 +14,37 @@ export interface SpeechSegment {
   speaker: string;
 }
 
+export interface MeetingNotes {
+  summary: string;
+  discussion_points: string[];
+  action_items: string[];
+  decisions: string[];
+  next_steps: string[];
+}
+
+export type DiarizationStatus = 'pending' | 'processing' | 'completed' | 'failed';
+
 export interface TranscriptionResult {
   title: string;
   speech_segments: SpeechSegment[];
   summary: string;
+  is_meeting?: boolean;
   readability?: {
     text: string;
     updated_at?: string;
   };
+  meeting_notes?: MeetingNotes;
+  diarization_status?: DiarizationStatus;
 }
 
 interface GeminiResponsePayload {
   title?: string;
   speech_segments?: SpeechSegment[];
   summary?: string;
+}
+
+interface TranscriptionRunOptions {
+  applySmartFormatting?: boolean;
 }
 
 export class GeminiTranscriber {
@@ -151,7 +168,8 @@ export class GeminiTranscriber {
     }
   }
 
-  async transcribeAudio(audioPath: string, modelOverride?: string): Promise<TranscriptionResult> {
+  async transcribeAudio(audioPath: string, modelOverride?: string, options: TranscriptionRunOptions = {}): Promise<TranscriptionResult> {
+    const applySmartFormatting = options.applySmartFormatting !== false;
     const { path: workingPath, cleanup } = await this.convertWebmIfNeeded(audioPath);
     let chunks: AudioChunk[] | null = null;
     try {
@@ -159,11 +177,11 @@ export class GeminiTranscriber {
       chunks = await splitAudio(workingPath, chunksDir);
 
       if (chunks.length <= 1) {
-        return await this.transcribeSingleAudio(workingPath, modelOverride);
+        return await this.transcribeSingleAudio(workingPath, modelOverride, applySmartFormatting);
       }
 
       console.log(`[GeminiTranscriber] Long audio detected: ${chunks.length} chunks`);
-      return await this.transcribeChunkedAudio(chunks, modelOverride);
+      return await this.transcribeChunkedAudio(chunks, modelOverride, applySmartFormatting);
     } finally {
       if (chunks) {
         await cleanupChunks(chunks, workingPath);
@@ -174,11 +192,16 @@ export class GeminiTranscriber {
     }
   }
 
-  private async transcribeSingleAudio(audioPath: string, modelOverride?: string): Promise<TranscriptionResult> {
+  private async transcribeSingleAudio(
+    audioPath: string,
+    modelOverride?: string,
+    applySmartFormatting: boolean = true,
+  ): Promise<TranscriptionResult> {
     const client = this.getClient();
     const settings = this.config.getSettings();
     const modelName = modelOverride || settings.geminiModel || 'gemini-3-flash-preview';
     const model = client.getGenerativeModel({ model: modelName });
+    const knownSpeakerNames = this.getKnownSpeakerNames(settings.speakerLabels);
 
     const transcriptionPrompt = buildTranscriptionPrompt({
       autoDetectSpeakers: settings.autoDetectSpeakers,
@@ -187,6 +210,7 @@ export class GeminiTranscriber {
       language: settings.language,
       summaryLength: settings.summaryLength,
       customTranscriptionPrompt: settings.customTranscriptionPrompt,
+      knownSpeakerNames,
     });
 
     const audioBytes = await fs.promises.readFile(audioPath);
@@ -210,10 +234,13 @@ export class GeminiTranscriber {
       end_time: seg.end_time,
       speaker: seg.speaker,
     }));
+    const formattedSegments = applySmartFormatting
+      ? await this.applySmartFormattingIfEligible(segments, modelName)
+      : segments;
 
     return {
       title: payload.title || 'Audio Transcription',
-      speech_segments: segments,
+      speech_segments: formattedSegments,
       summary: payload.summary || 'No summary available',
     };
   }
@@ -221,6 +248,7 @@ export class GeminiTranscriber {
   private async transcribeChunkedAudio(
     chunks: AudioChunk[],
     modelOverride?: string,
+    applySmartFormatting: boolean = true,
   ): Promise<TranscriptionResult> {
     const settings = this.config.getSettings();
     const modelName = modelOverride || settings.geminiModel || 'gemini-3-flash-preview';
@@ -233,6 +261,7 @@ export class GeminiTranscriber {
       language: settings.language,
       summaryLength: settings.summaryLength,
       customTranscriptionPrompt: settings.customTranscriptionPrompt,
+      knownSpeakerNames: this.getKnownSpeakerNames(settings.speakerLabels),
     };
 
     if (promptSettings.customTranscriptionPrompt?.trim()) {
@@ -304,7 +333,9 @@ export class GeminiTranscriber {
 
     return {
       title: allTitles[0] || 'Audio Transcription',
-      speech_segments: allSegments,
+      speech_segments: applySmartFormatting
+        ? await this.applySmartFormattingIfEligible(allSegments, modelName)
+        : allSegments,
       summary: allSummaries[0] || 'No summary available',
     };
   }
@@ -416,5 +447,75 @@ export class GeminiTranscriber {
     const prompt = buildPolishPrompt(style, customPrompt);
     const result = await model.generateContent(`${prompt}\n\n${text}`);
     return result.response.text().trim();
+  }
+
+  private getKnownSpeakerNames(speakerLabels: Record<string, string> | undefined): string[] {
+    if (!speakerLabels || typeof speakerLabels !== 'object') {
+      return [];
+    }
+    const labels = Object.values(speakerLabels)
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+    return Array.from(new Set(labels)).slice(0, 20);
+  }
+
+  private shouldApplySmartFormatting(segments: SpeechSegment[]): boolean {
+    if (!Array.isArray(segments) || segments.length === 0) {
+      return false;
+    }
+    const uniqueSpeakers = new Set(
+      segments
+        .map((segment) => String(segment.speaker || '').trim().toLowerCase())
+        .filter(Boolean),
+    );
+    return uniqueSpeakers.size <= 1;
+  }
+
+  private async applySmartFormattingIfEligible(segments: SpeechSegment[], modelName: string): Promise<SpeechSegment[]> {
+    if (!this.shouldApplySmartFormatting(segments)) {
+      return segments;
+    }
+
+    const rawText = segments
+      .map((segment) => String(segment.content || '').trim())
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (!rawText) {
+      return segments;
+    }
+
+    try {
+      const model = this.getClient().getGenerativeModel({ model: modelName });
+      const result = await model.generateContent(`${LIVE_TRANSCRIPTION_PROMPT}\n\nDictation transcript:\n${rawText}`);
+      const formatted = this.normalizeMarkdownOutput(result.response.text());
+      if (!formatted) {
+        return segments;
+      }
+      return [
+        {
+          content: formatted,
+          start_time: segments[0]?.start_time || '',
+          end_time: segments[segments.length - 1]?.end_time || '',
+          speaker: segments[0]?.speaker || 'Speaker 1',
+        },
+      ];
+    } catch (err) {
+      console.warn('[GeminiTranscriber] Smart formatting failed, using raw transcript:', err);
+      return segments;
+    }
+  }
+
+  private normalizeMarkdownOutput(text: string): string {
+    const raw = String(text || '').trim();
+    if (!raw) {
+      return '';
+    }
+
+    if (raw.startsWith('```')) {
+      const withoutFence = raw.replace(/^```[a-zA-Z]*\s*/, '').replace(/```$/, '').trim();
+      return withoutFence;
+    }
+    return raw;
   }
 }

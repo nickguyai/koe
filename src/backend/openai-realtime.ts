@@ -1,11 +1,18 @@
 import { EventEmitter } from 'events';
 import WebSocket, { RawData } from 'ws';
 
-type RealtimeStatus = 'idle' | 'connecting' | 'connected' | 'processing' | 'completed';
+type RealtimeStatus = 'idle' | 'connecting' | 'connected' | 'processing' | 'reconnecting' | 'completed';
+type SessionMode = 'single' | 'meeting';
+export type RealtimeInstructions = string | { single?: string; meeting?: string };
 
 export interface RealtimeTextEvent {
   content: string;
   isNewResponse: boolean;
+}
+
+export interface RealtimeSegmentEvent {
+  segment: string;
+  allSegments: string[];
 }
 
 export interface RealtimeStructuredEvent {
@@ -16,6 +23,9 @@ export class OpenAIRealtimeClient extends EventEmitter {
   private apiKey: string;
   private model: string;
   private transcriptionModel: string;
+  private singleModeInstructions?: string;
+  private meetingModeInstructions?: string;
+  private language?: string;
   private ws: WebSocket | null = null;
   private ready = false;
   private closed = false;
@@ -26,15 +36,35 @@ export class OpenAIRealtimeClient extends EventEmitter {
   private readyRejecter: ((err: Error) => void) | null = null;
   private readyPromise: Promise<void> | null = null;
   private disconnectPromise: Promise<void> | null = null;
+  private sessionMode: SessionMode = 'single';
+  private meetingSegments: string[] = [];
+  private meetingStopRequested = false;
+  private reconnectAttempts = 0;
+  private readonly maxReconnectAttempts = 3;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private wasManuallyDisconnected = false;
+  private lastSegmentAt = 0;
+  private commitAudioAt = 0;
 
-  constructor(apiKey: string, model: string = 'gpt-realtime-2025-08-28', transcriptionModel: string = 'gpt-4o-transcribe') {
+  constructor(
+    apiKey: string,
+    model: string = 'gpt-realtime-2025-08-28',
+    transcriptionModel: string = 'gpt-4o-transcribe',
+    instructions?: RealtimeInstructions,
+    language?: string,
+  ) {
     super();
     this.apiKey = apiKey;
     this.model = model;
     this.transcriptionModel = transcriptionModel;
+    this.setInstructions(instructions);
+    const lang = language?.trim();
+    this.language = lang && lang !== 'auto' ? lang : undefined;
   }
 
-  async connect(): Promise<void> {
+  async connect(mode: SessionMode = 'single'): Promise<void> {
+    this.sessionMode = mode;
+
     if (this.disconnectPromise) {
       await this.disconnectPromise;
     }
@@ -42,6 +72,9 @@ export class OpenAIRealtimeClient extends EventEmitter {
     if (this.ws) {
       return this.readyPromise ?? Promise.resolve();
     }
+
+    this.clearReconnectTimer();
+    this.wasManuallyDisconnected = false;
 
     if (this.closed) {
       this.closed = false;
@@ -68,16 +101,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
     });
 
     ws.on('close', () => {
-      const wasReady = this.ready;
-      this.ready = false;
-      this.ws = null;
-      if (!wasReady && this.readyRejecter) {
-        this.readyRejecter(new Error('WebSocket closed before ready'));
-      }
-      this.readyResolver = null;
-      this.readyRejecter = null;
-      this.readyPromise = null;
-      this.emitStatus('idle');
+      this.handleSocketClose();
     });
 
     ws.on('error', (err: Error) => {
@@ -87,10 +111,48 @@ export class OpenAIRealtimeClient extends EventEmitter {
         this.readyRejecter = null;
         this.readyPromise = null;
       }
+
+      // During long-running meeting mode, transient network blips are recoverable.
+      // Reconnection is driven by close events, so avoid emitting a fatal error here.
+      if (this.ready && this.isRecoverableMeetingDrop()) {
+        this.emitStatus('reconnecting');
+        return;
+      }
       this.emitError(err instanceof Error ? err.message : String(err));
     });
 
     return this.readyPromise;
+  }
+
+  async startMeeting(): Promise<void> {
+    this.sessionMode = 'meeting';
+    this.meetingStopRequested = false;
+    this.meetingSegments = [];
+    this.reconnectAttempts = 0;
+    this.lastSegmentAt = 0;
+    this.commitAudioAt = 0;
+    await this.connect('meeting');
+  }
+
+  async stopMeeting(): Promise<string> {
+    this.meetingStopRequested = true;
+
+    // Flush any queued audio appends before starting the shutdown timer
+    await this.sendQueue;
+
+    // server_vad auto-commits audio; just set timestamp for waitForMeetingSegments()
+    this.commitAudioAt = Date.now();
+    this.emitStatus('processing');
+
+    await this.waitForMeetingSegments(5000);
+    const transcript = this.meetingSegments.join('\n').trim();
+    this.emitStatus('completed');
+    await this.disconnect();
+    return transcript;
+  }
+
+  getMeetingSegments(): string[] {
+    return [...this.meetingSegments];
   }
 
   async sendAudio(audio: ArrayBuffer | Buffer): Promise<void> {
@@ -99,6 +161,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
       this.pendingAudio.push(buffer);
       return;
     }
+
     await this.enqueueSend(
       JSON.stringify({
         type: 'input_audio_buffer.append',
@@ -113,7 +176,11 @@ export class OpenAIRealtimeClient extends EventEmitter {
     }
     await this.sendQueue;
     this.emitStatus('processing');
+    this.commitAudioAt = Date.now();
     await this.enqueueSend(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+    if (this.sessionMode === 'single' && this.hasInstructions()) {
+      await this.enqueueSend(JSON.stringify({ type: 'response.create' }));
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -122,6 +189,9 @@ export class OpenAIRealtimeClient extends EventEmitter {
     }
 
     this.closed = true;
+    this.wasManuallyDisconnected = true;
+    this.clearReconnectTimer();
+
     const ws = this.ws;
     if (!ws) {
       this.ready = false;
@@ -161,25 +231,28 @@ export class OpenAIRealtimeClient extends EventEmitter {
       await this.disconnectPromise;
     } finally {
       this.disconnectPromise = null;
+      this.emitStatus('idle');
     }
   }
 
   private async enqueueSend(payload: string): Promise<void> {
-    if (!this.ws) {
-      return;
-    }
-    this.sendQueue = this.sendQueue.then(
-      () =>
-        new Promise<void>((resolve, reject) => {
-          this.ws!.send(payload, (err?: Error) => {
-            if (err) {
-              reject(err);
-              return;
-            }
-            resolve();
-          });
-        }),
-    );
+    const enqueue = () =>
+      new Promise<void>((resolve) => {
+        const socket = this.ws;
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          resolve();
+          return;
+        }
+        socket.send(payload, (err?: Error) => {
+          if (err) {
+            console.warn('[Realtime] WebSocket send error:', err.message);
+          }
+          // Always resolve to keep the queue healthy after transient failures.
+          resolve();
+        });
+      });
+
+    this.sendQueue = this.sendQueue.then(enqueue, enqueue);
     return this.sendQueue;
   }
 
@@ -187,20 +260,41 @@ export class OpenAIRealtimeClient extends EventEmitter {
     if (!this.ws) {
       return;
     }
+
+    const turnDetection =
+      this.sessionMode === 'meeting'
+        ? {
+            type: 'server_vad',
+            silence_duration_ms: 700,
+            prefix_padding_ms: 500,
+          }
+        : null;
+
+    const session: Record<string, unknown> = {
+      modalities: ['text'],
+      input_audio_format: 'pcm16',
+      turn_detection: turnDetection,
+    };
+
+    const activeInstructions = this.getCurrentInstructions();
+    if (activeInstructions) {
+      session.instructions = activeInstructions;
+    } else {
+      session.input_audio_transcription = {
+        model: this.transcriptionModel,
+        ...(this.language ? { language: this.language } : {}),
+      };
+    }
+
     await this.enqueueSend(
       JSON.stringify({
         type: 'session.update',
-        session: {
-          modalities: ['text'],
-          input_audio_format: 'pcm16',
-          input_audio_transcription: {
-            model: this.transcriptionModel,
-          },
-          turn_detection: null,
-        },
+        session,
       }),
     );
+
     this.ready = true;
+    this.reconnectAttempts = 0;
     if (this.readyResolver) {
       this.readyResolver();
     }
@@ -214,6 +308,63 @@ export class OpenAIRealtimeClient extends EventEmitter {
       for (const chunk of chunks) {
         await this.sendAudio(chunk);
       }
+    }
+  }
+
+  private handleSocketClose(): void {
+    const wasReady = this.ready;
+    this.ready = false;
+    this.ws = null;
+
+    if (!wasReady && this.readyRejecter) {
+      this.readyRejecter(new Error('WebSocket closed before ready'));
+    }
+
+    this.readyResolver = null;
+    this.readyRejecter = null;
+    this.readyPromise = null;
+
+    if (this.shouldReconnectForMeeting()) {
+      this.scheduleReconnect();
+      return;
+    }
+
+    if (!this.wasManuallyDisconnected && this.meetingStopRequested) {
+      this.emitStatus('completed');
+      return;
+    }
+
+    this.emitStatus('idle');
+  }
+
+  private shouldReconnectForMeeting(): boolean {
+    return (
+      this.sessionMode === 'meeting' &&
+      !this.closed &&
+      !this.wasManuallyDisconnected &&
+      !this.meetingStopRequested &&
+      this.reconnectAttempts < this.maxReconnectAttempts
+    );
+  }
+
+  private scheduleReconnect(): void {
+    this.clearReconnectTimer();
+    this.reconnectAttempts += 1;
+    const delayMs = Math.min(3000, this.reconnectAttempts * 1000);
+    this.emitStatus('reconnecting');
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect('meeting').catch((err) => {
+        this.emitError(err instanceof Error ? err.message : String(err));
+      });
+    }, delayMs);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
   }
 
@@ -240,16 +391,26 @@ export class OpenAIRealtimeClient extends EventEmitter {
     }
 
     if (type === 'conversation.item.input_audio_transcription.completed') {
-      const transcript = String((data as { transcript?: string }).transcript || '');
+      const transcript = String((data as { transcript?: string }).transcript || '').trim();
       if (transcript) {
-        this.emit('text', { content: transcript, isNewResponse: true } as RealtimeTextEvent);
+        if (this.sessionMode === 'meeting') {
+          this.appendMeetingSegment(transcript);
+        } else {
+          this.emit('text', { content: transcript, isNewResponse: true } as RealtimeTextEvent);
+        }
       }
-      this.emitStatus('completed');
-      void this.disconnect();
+
+      if (this.sessionMode === 'single') {
+        this.emitStatus('completed');
+        void this.disconnect();
+      }
       return;
     }
 
     if (type === 'response.text.delta' || type === 'response.output_text.delta') {
+      if (this.sessionMode === 'meeting') {
+        return;
+      }
       const delta = String((data as { delta?: string }).delta || '');
       if (delta) {
         this.currentResponseText += delta;
@@ -259,14 +420,35 @@ export class OpenAIRealtimeClient extends EventEmitter {
     }
 
     if (type === 'response.done' || type === 'response.text.done' || type === 'response.output_text.done') {
+      if (this.sessionMode === 'meeting') {
+        return;
+      }
       this.handleResponseDone();
       return;
     }
 
     if (type === 'error') {
       const messageText = String((data as { error?: { message?: string } }).error?.message || 'OpenAI error');
+      // server_vad auto-commits; suppress benign empty-buffer errors in meeting mode
+      if (this.sessionMode === 'meeting' && messageText.includes('buffer too small')) {
+        return;
+      }
       this.emitError(messageText);
     }
+  }
+
+  private appendMeetingSegment(segment: string): void {
+    const cleaned = segment.trim();
+    if (!cleaned) {
+      return;
+    }
+
+    this.meetingSegments.push(cleaned);
+    this.lastSegmentAt = Date.now();
+    this.emit('segment', {
+      segment: cleaned,
+      allSegments: [...this.meetingSegments],
+    } as RealtimeSegmentEvent);
   }
 
   private handleResponseDone(): void {
@@ -284,9 +466,18 @@ export class OpenAIRealtimeClient extends EventEmitter {
       finalText = segments.map((seg) => seg.content || '').filter(Boolean).join('\n');
     }
 
-    this.emit('text', { content: finalText, isNewResponse: true } as RealtimeTextEvent);
-    this.emitStatus('completed');
-    void this.disconnect();
+    if (finalText) {
+      if (this.sessionMode === 'meeting') {
+        this.appendMeetingSegment(finalText);
+      } else {
+        this.emit('text', { content: finalText, isNewResponse: true } as RealtimeTextEvent);
+      }
+    }
+
+    if (this.sessionMode === 'single') {
+      this.emitStatus('completed');
+      void this.disconnect();
+    }
   }
 
   private tryParseStructuredResult(text: string): Record<string, unknown> | null {
@@ -301,6 +492,74 @@ export class OpenAIRealtimeClient extends EventEmitter {
     } catch {
       return null;
     }
+  }
+
+  private async waitForMeetingSegments(timeoutMs: number): Promise<void> {
+    const start = Date.now();
+    // Track segment count at call time to detect if a new segment arrives post-commit
+    const segmentCountAtCommit = this.meetingSegments.length;
+
+    while (Date.now() - start < timeoutMs) {
+      // No finalized segment yet: keep waiting until timeout.
+      if (this.lastSegmentAt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+
+      // If commitAudioAt is set, wait until a segment arrives AFTER the commit.
+      // This ensures we don't exit early when commitAudio() triggers a trailing transcription.
+      if (this.commitAudioAt > 0 && this.lastSegmentAt < this.commitAudioAt) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+
+      // Require at least one new segment since commit was issued
+      if (this.commitAudioAt > 0 && this.meetingSegments.length === segmentCountAtCommit) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+
+      const sinceLastSegment = Date.now() - this.lastSegmentAt;
+      // 450ms threshold: Wait long enough for any trailing audio from server VAD to be finalized
+      // after commitAudio(), but short enough to avoid noticeable delay. OpenAI typically finalizes
+      // segments within 200-400ms of silence detection.
+      if (sinceLastSegment >= 450) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  private isRecoverableMeetingDrop(): boolean {
+    return this.sessionMode === 'meeting' && !this.closed && !this.wasManuallyDisconnected && !this.meetingStopRequested;
+  }
+
+  private hasInstructions(): boolean {
+    return Boolean(this.getCurrentInstructions());
+  }
+
+  private setInstructions(instructions?: RealtimeInstructions): void {
+    if (typeof instructions === 'string') {
+      const trimmed = instructions.trim();
+      this.singleModeInstructions = trimmed || undefined;
+      this.meetingModeInstructions = trimmed || undefined;
+      return;
+    }
+
+    const single = instructions?.single?.trim() || '';
+    const meeting = instructions?.meeting?.trim() || '';
+    this.singleModeInstructions = single || undefined;
+    this.meetingModeInstructions = meeting || undefined;
+  }
+
+  private getCurrentInstructions(): string | undefined {
+    if (this.sessionMode === 'meeting') {
+      // Meeting mode: return only meetingModeInstructions (no fallback).
+      // When undefined, handleSessionCreated uses input_audio_transcription
+      // for pure transcription without conversational meta-responses.
+      return this.meetingModeInstructions;
+    }
+    return this.singleModeInstructions;
   }
 
   private emitStatus(status: RealtimeStatus): void {
