@@ -70,6 +70,15 @@ function bindSystemAudioEvents(): void {
     systemAudioQueue.length = 0;
     sendRealtimeEvent({ type: 'system_audio_error', content: message });
   });
+  systemAudio.on('recovery-scheduled', (info: { attempt: number; maxAttempts: number; delayMs: number }) => {
+    sendRealtimeEvent({ type: 'system_audio_recovering', ...info });
+  });
+  systemAudio.on('recovery-succeeded', () => {
+    sendRealtimeEvent({ type: 'system_audio_recovered' });
+  });
+  systemAudio.on('recovery-failed', () => {
+    sendRealtimeEvent({ type: 'system_audio_recovery_failed' });
+  });
   systemAudioListenersBound = true;
 }
 
@@ -90,16 +99,21 @@ async function startSystemAudioCapture(): Promise<boolean> {
     return false;
   }
 
-  const started = await getSystemAudioService().start({ sampleRate: 24000 });
+  const systemAudio = getSystemAudioService();
+  const started = await systemAudio.start({ sampleRate: 24000 });
   if (!started) {
     sendRealtimeEvent({ type: 'system_audio_permission', status: 'unavailable' });
+  } else if (realtimeMeetingMode) {
+    systemAudio.enableRecovery();
   }
   return started;
 }
 
 async function stopSystemAudioCapture(): Promise<void> {
   systemAudioQueue.length = 0;
-  await getSystemAudioService().stop();
+  const systemAudio = getSystemAudioService();
+  systemAudio.disableRecovery();
+  await systemAudio.stop();
 }
 
 function getRendererPath(): string {

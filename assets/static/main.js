@@ -425,6 +425,19 @@ function showToast(message) {
     }, 2500);
 }
 
+function showSystemAudioWarning(message) {
+    const el = document.getElementById('systemAudioWarning');
+    if (!el) return;
+    el.textContent = message;
+    el.style.display = 'block';
+}
+
+function hideSystemAudioWarning() {
+    const el = document.getElementById('systemAudioWarning');
+    if (!el) return;
+    el.style.display = 'none';
+}
+
 async function copyToClipboard(text) {
     if (!text) return;
     try {
@@ -1175,14 +1188,14 @@ async function copyMeetingMarkdown(jobId) {
     try {
         const data = await api.exportJob(jobId);
         if (!data?.markdown) {
-            showToast('No markdown export available');
+            showToast('No content to copy');
             return;
         }
         await navigator.clipboard.writeText(data.markdown);
-        showToast('Meeting markdown copied');
+        showToast('Copied to clipboard');
     } catch (e) {
         console.error('Copy markdown error:', e);
-        showToast('Failed to copy markdown');
+        showToast('Failed to copy');
     }
 }
 
@@ -1465,29 +1478,40 @@ function renderMeetingSummary(transcription) {
                     </div>
                 </div>
                 <div class="summary-actions">
-                    <button class="detail-action-btn" id="summaryCopyMarkdownBtn" title="Copy meeting markdown">
+                    <button class="detail-action-btn" id="summaryCopyBtn" title="Copy markdown">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <rect x="4" y="2" width="16" height="20" rx="2"></rect>
-                            <line x1="8" y1="7" x2="16" y2="7"></line>
-                            <line x1="8" y1="11" x2="16" y2="11"></line>
-                            <line x1="8" y1="15" x2="13" y2="15"></line>
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                         </svg>
-                        <span>Copy Markdown</span>
+                        <span>Copy</span>
                     </button>
-                    <button class="detail-action-btn" id="summaryShareEmailBtn" title="Share by email">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <rect x="3" y="5" width="18" height="14" rx="2"></rect>
-                            <polyline points="3 7 12 13 21 7"></polyline>
-                        </svg>
-                        <span>Email</span>
-                    </button>
-                    <button class="detail-action-btn" id="summaryShareNotionBtn" title="Open in Notion">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <rect x="3" y="3" width="18" height="18" rx="2"></rect>
-                            <path d="M8 16V8l7 8V8"></path>
-                        </svg>
-                        <span>Notion</span>
-                    </button>
+                    <div class="export-btn-wrapper">
+                        <button class="detail-action-btn" id="summaryExportBtn" title="Export">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="17 8 12 3 7 8"></polyline>
+                                <line x1="12" x2="12" y1="3" y2="15"></line>
+                            </svg>
+                            <span>Export</span>
+                        </button>
+                        <div class="export-popup" id="summaryExportPopup">
+                            <button class="export-popup-item" id="summaryExportDownloadBtn">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                    <polyline points="7 10 12 15 17 10"></polyline>
+                                    <line x1="12" x2="12" y1="15" y2="3"></line>
+                                </svg>
+                                <span>Download</span>
+                            </button>
+                            <button class="export-popup-item" id="summaryExportNotionBtn">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                                    <path d="M8 16V8l7 8V8"></path>
+                                </svg>
+                                <span>Notion</span>
+                            </button>
+                        </div>
+                    </div>
                     <button class="detail-action-btn" id="summaryViewFullBtn" title="View full transcript">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"></path>
@@ -1555,19 +1579,35 @@ function setupMeetingSummaryListeners(transcription) {
         });
     }
 
-    const copyMarkdownBtn = document.getElementById('summaryCopyMarkdownBtn');
-    if (copyMarkdownBtn) {
-        copyMarkdownBtn.addEventListener('click', () => copyMeetingMarkdown(transcription.id));
+    const copyBtn = document.getElementById('summaryCopyBtn');
+    if (copyBtn) {
+        copyBtn.addEventListener('click', () => copyMeetingMarkdown(transcription.id));
     }
 
-    const shareEmailBtn = document.getElementById('summaryShareEmailBtn');
-    if (shareEmailBtn) {
-        shareEmailBtn.addEventListener('click', () => shareMeetingByEmail(transcription.id));
+    const exportBtn = document.getElementById('summaryExportBtn');
+    const exportPopup = document.getElementById('summaryExportPopup');
+    if (exportBtn && exportPopup) {
+        exportBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            exportPopup.classList.toggle('open');
+        });
+        document.addEventListener('click', () => exportPopup.classList.remove('open'), { once: false });
     }
 
-    const shareNotionBtn = document.getElementById('summaryShareNotionBtn');
-    if (shareNotionBtn) {
-        shareNotionBtn.addEventListener('click', () => shareMeetingToNotion(transcription.id));
+    const exportDownloadBtn = document.getElementById('summaryExportDownloadBtn');
+    if (exportDownloadBtn) {
+        exportDownloadBtn.addEventListener('click', () => {
+            exportPopup && exportPopup.classList.remove('open');
+            downloadTranscript(transcription.id);
+        });
+    }
+
+    const exportNotionBtn = document.getElementById('summaryExportNotionBtn');
+    if (exportNotionBtn) {
+        exportNotionBtn.addEventListener('click', () => {
+            exportPopup && exportPopup.classList.remove('open');
+            shareMeetingToNotion(transcription.id);
+        });
     }
 
     const viewFullBtn = document.getElementById('summaryViewFullBtn');
@@ -2061,6 +2101,17 @@ function handleLiveMessage(data) {
         }
     } else if (data.type === 'system_audio_error') {
         showToast(data.content || 'System audio capture error');
+    } else if (data.type === 'system_audio_recovering') {
+        showSystemAudioWarning('System audio interrupted \u2014 recovering (attempt ' + data.attempt + '/' + data.maxAttempts + ')...');
+    } else if (data.type === 'system_audio_recovered') {
+        showToast('System audio recovered');
+        hideSystemAudioWarning();
+    } else if (data.type === 'system_audio_recovery_failed') {
+        showSystemAudioWarning('System audio lost \u2014 continuing with microphone only');
+    } else if (data.type === 'system_audio_status') {
+        if (data.status === 'recording') {
+            hideSystemAudioWarning();
+        }
     } else if (data.type === 'meeting_notes_ready') {
         const jobId = data.jobId;
         if (!jobId) return;
@@ -2355,6 +2406,7 @@ function cleanupLiveAudio() {
     liveMeetingSegments = [];
     liveMeetingDisplaySegments = [];
     liveMeetingTranscript = '';
+    hideSystemAudioWarning();
     // Stop parallel MediaRecorder if still active
     if (liveMediaRecorder && liveMediaRecorder.state !== 'inactive') {
         liveMediaRecorder.stop();
@@ -3092,21 +3144,6 @@ function renderDetailView(transcription) {
 
     cleanupDetailAudio();
     const isMeetingTranscription = !!transcription.isMeeting || !!transcription.meetingNotes;
-    const meetingShareTemplate = document.getElementById('meetingShareActionsTemplate');
-    const meetingShareActionsHtml = isMeetingTranscription
-        ? (meetingShareTemplate ? meetingShareTemplate.innerHTML : '')
-        : '';
-    const viewSummaryBtnHtml = isMeetingTranscription
-        ? `<button class="detail-action-btn" id="detailViewSummaryBtn" title="View meeting summary">
-               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                   <rect x="3" y="3" width="18" height="18" rx="2"></rect>
-                   <line x1="7" y1="8" x2="17" y2="8"></line>
-                   <line x1="7" y1="12" x2="17" y2="12"></line>
-                   <line x1="7" y1="16" x2="13" y2="16"></line>
-               </svg>
-               <span>Summary</span>
-           </button>`
-        : '';
 
     const speakersHtml = transcription.speakers.map((speaker, i) => {
         const segmentCount = transcription.segments.filter(s => s.speaker === speaker.id).length;
@@ -3261,29 +3298,40 @@ function renderDetailView(transcription) {
                 </div>
                 <div class="detail-actions">
                     ${retranscribeButtonHtml}
-                    <button class="detail-action-btn polish-btn ${hasGeminiApiKey ? '' : 'disabled'}" id="detailPolishBtn" title="${hasGeminiApiKey ? 'Polish transcript' : 'Add Google API key in Settings to enable Polish'}">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z"></path>
-                        </svg>
-                        <span>Polish</span>
-                        ${hasGeminiApiKey ? '' : '<span class="btn-hint">No API key</span>'}
-                    </button>
-                    <button class="detail-action-btn copy-btn" id="detailCopyBtn" title="Copy to clipboard">
+                    <button class="detail-action-btn" id="detailCopyBtn" title="Copy markdown">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                             <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                             <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                         </svg>
                         <span>Copy</span>
                     </button>
-                    ${viewSummaryBtnHtml}
-                    ${meetingShareActionsHtml}
-                    <button class="detail-action-btn" id="detailDownloadBtn" title="Download">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                            <polyline points="7 10 12 15 17 10"></polyline>
-                            <line x1="12" x2="12" y1="15" y2="3"></line>
-                        </svg>
-                    </button>
+                    <div class="export-btn-wrapper">
+                        <button class="detail-action-btn" id="detailExportBtn" title="Export">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="17 8 12 3 7 8"></polyline>
+                                <line x1="12" x2="12" y1="3" y2="15"></line>
+                            </svg>
+                            <span>Export</span>
+                        </button>
+                        <div class="export-popup" id="detailExportPopup">
+                            <button class="export-popup-item" id="detailExportDownloadBtn">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                    <polyline points="7 10 12 15 17 10"></polyline>
+                                    <line x1="12" x2="12" y1="15" y2="3"></line>
+                                </svg>
+                                <span>Download</span>
+                            </button>
+                            <button class="export-popup-item" id="detailExportNotionBtn">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                                    <path d="M8 16V8l7 8V8"></path>
+                                </svg>
+                                <span>Notion</span>
+                            </button>
+                        </div>
+                    </div>
                     <button class="detail-action-btn danger" id="detailDeleteBtn" title="Delete">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                             <path d="M3 6h18"></path>
@@ -3351,15 +3399,6 @@ function setupDetailViewListeners() {
         });
     }
 
-    // View Summary button (for meetings)
-    const viewSummaryBtn = document.getElementById('detailViewSummaryBtn');
-    if (viewSummaryBtn && selectedTranscription) {
-        viewSummaryBtn.addEventListener('click', () => {
-            showMeetingSummary(selectedTranscription, 'detail');
-        });
-    }
-
-    // Re-transcribe button
     const retranscribeBtn = document.getElementById('detailRetranscribeBtn');
     if (retranscribeBtn && selectedTranscription) {
         retranscribeBtn.addEventListener('click', () => {
@@ -3367,52 +3406,39 @@ function setupDetailViewListeners() {
         });
     }
 
-    // Polish button
-    const polishBtn = document.getElementById('detailPolishBtn');
-    if (polishBtn && selectedTranscription) {
-        polishBtn.addEventListener('click', () => {
-            polishTranscript(selectedTranscription.id);
-        });
-    }
-
-    // Copy button
     const copyBtn = document.getElementById('detailCopyBtn');
     if (copyBtn && selectedTranscription) {
         copyBtn.addEventListener('click', () => {
-            copyTranscriptText(selectedTranscription.id);
-        });
-    }
-
-    const copyMarkdownBtn = document.getElementById('detailCopyMarkdownBtn');
-    if (copyMarkdownBtn && selectedTranscription) {
-        copyMarkdownBtn.addEventListener('click', () => {
             copyMeetingMarkdown(selectedTranscription.id);
         });
     }
 
-    const shareEmailBtn = document.getElementById('detailShareEmailBtn');
-    if (shareEmailBtn && selectedTranscription) {
-        shareEmailBtn.addEventListener('click', () => {
-            shareMeetingByEmail(selectedTranscription.id);
+    const exportBtn = document.getElementById('detailExportBtn');
+    const exportPopup = document.getElementById('detailExportPopup');
+    if (exportBtn && exportPopup) {
+        exportBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            exportPopup.classList.toggle('open');
         });
+        document.addEventListener('click', () => exportPopup.classList.remove('open'), { once: false });
     }
 
-    const shareNotionBtn = document.getElementById('detailShareNotionBtn');
-    if (shareNotionBtn && selectedTranscription) {
-        shareNotionBtn.addEventListener('click', () => {
-            shareMeetingToNotion(selectedTranscription.id);
-        });
-    }
-
-    // Download button
-    const downloadBtn = document.getElementById('detailDownloadBtn');
-    if (downloadBtn && selectedTranscription) {
-        downloadBtn.addEventListener('click', () => {
+    const exportDownloadBtn = document.getElementById('detailExportDownloadBtn');
+    if (exportDownloadBtn && selectedTranscription) {
+        exportDownloadBtn.addEventListener('click', () => {
+            exportPopup && exportPopup.classList.remove('open');
             downloadTranscript(selectedTranscription.id);
         });
     }
 
-    // Delete button
+    const exportNotionBtn = document.getElementById('detailExportNotionBtn');
+    if (exportNotionBtn && selectedTranscription) {
+        exportNotionBtn.addEventListener('click', () => {
+            exportPopup && exportPopup.classList.remove('open');
+            shareMeetingToNotion(selectedTranscription.id);
+        });
+    }
+
     const deleteBtn = document.getElementById('detailDeleteBtn');
     if (deleteBtn && selectedTranscription) {
         deleteBtn.addEventListener('click', () => {

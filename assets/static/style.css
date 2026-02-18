@@ -1137,6 +1137,22 @@ body.is-recording .recording-hint {
     transform: translate(-50%, 0);
 }
 
+.system-audio-warning {
+    position: fixed;
+    top: 40px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(180, 100, 20, 0.92);
+    color: #fff;
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-size: 13px;
+    z-index: 9999;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    text-align: center;
+    max-width: 420px;
+}
+
 /* Transcription Detail View */
 .detail-back-btn {
     display: flex;
@@ -1164,8 +1180,8 @@ body.is-recording .recording-hint {
 
 .detail-header {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
+    flex-direction: column;
+    gap: 16px;
     margin-bottom: 32px;
 }
 
@@ -1256,6 +1272,47 @@ body.is-recording .recording-hint {
 
 .detail-action-btn span {
     line-height: 1;
+}
+
+.export-btn-wrapper {
+    position: relative;
+}
+
+.export-popup {
+    display: none;
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    min-width: 160px;
+    background: var(--washi-white, #faf9f6);
+    border: 1px solid rgba(28, 28, 28, 0.1);
+    border-radius: 4px 12px 4px 12px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+    z-index: 100;
+    padding: 6px 0;
+}
+
+.export-popup.open {
+    display: block;
+}
+
+.export-popup-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 16px;
+    border: none;
+    background: transparent;
+    color: var(--brushed-gray);
+    cursor: pointer;
+    font-size: 13px;
+    text-align: left;
+    transition: background 0.2s ease;
+}
+
+.export-popup-item:hover {
+    background: rgba(28, 28, 28, 0.04);
 }
 
 .detail-audio {
@@ -2453,9 +2510,8 @@ body.meeting-mode .recording-time.active {
    ============================================ */
 .summary-header {
     display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 24px;
+    flex-direction: column;
+    gap: 16px;
     margin-bottom: 32px;
 }
 

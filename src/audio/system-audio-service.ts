@@ -4,6 +4,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const SILENCE_RMS_THRESHOLD = 100;
+const MAX_RECOVERY_ATTEMPTS = 3;
+const INITIAL_RECOVERY_DELAY_MS = 500;
 
 export type SystemAudioStatus = 'idle' | 'recording' | 'unsupported' | 'error';
 
@@ -30,6 +32,10 @@ export class SystemAudioService extends EventEmitter {
   private includeProcessNames: string[] = [];
   private emittedMeetingApps: Set<string> = new Set();
   private lastActiveProcessName: string | null = null;
+  private recoveryEnabled = false;
+  private recoveryAttempts = 0;
+  private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastStartOptions: SystemAudioStartOptions = {};
 
   get currentStatus(): SystemAudioStatus {
     return this.status;
@@ -37,6 +43,22 @@ export class SystemAudioService extends EventEmitter {
 
   get latestChunk(): Buffer | null {
     return this.lastChunk;
+  }
+
+  /** Enable auto-recovery so the service restarts on unexpected stop/error. */
+  enableRecovery(): void {
+    this.recoveryEnabled = true;
+    this.recoveryAttempts = 0;
+  }
+
+  /** Disable auto-recovery (called on intentional stop). */
+  disableRecovery(): void {
+    this.recoveryEnabled = false;
+    this.recoveryAttempts = 0;
+    if (this.recoveryTimer) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = null;
+    }
   }
 
   async start(options: SystemAudioStartOptions = {}): Promise<boolean> {
@@ -53,6 +75,7 @@ export class SystemAudioService extends EventEmitter {
     // lives in resources/bin/ rather than the default node_modules location.
     const binaryPath = this.resolveBinaryPath();
 
+    this.lastStartOptions = options;
     this.includeProcessNames = (options.includeProcessNames || [])
       .map((name) => String(name || '').trim())
       .filter(Boolean);
@@ -80,8 +103,13 @@ export class SystemAudioService extends EventEmitter {
       });
 
       audioTee.on('error', (err) => {
+        // Clear the failed instance so start() won't short-circuit during recovery.
+        if (this.audioTee === audioTee) {
+          this.audioTee = null;
+        }
         this.setStatus('error');
         this.emit('error', err instanceof Error ? err : new Error(String(err)));
+        this.scheduleRecovery();
       });
 
       audioTee.on('log', (_level, message) => {
@@ -101,6 +129,7 @@ export class SystemAudioService extends EventEmitter {
           if (this.status !== 'idle') {
             this.setStatus('idle');
           }
+          this.scheduleRecovery();
         }
       });
 
@@ -117,6 +146,7 @@ export class SystemAudioService extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    this.disableRecovery();
     const audioTee = this.audioTee;
     this.lastChunk = null;
     this.includeProcessNames = [];
@@ -139,6 +169,50 @@ export class SystemAudioService extends EventEmitter {
     }
     this.status = next;
     this.emit('status', next);
+  }
+
+  private scheduleRecovery(): void {
+    if (!this.recoveryEnabled) {
+      return;
+    }
+    if (this.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+      console.warn(`[SystemAudio] Recovery exhausted after ${MAX_RECOVERY_ATTEMPTS} attempts`);
+      this.emit('recovery-failed');
+      this.disableRecovery();
+      return;
+    }
+
+    const delay = INITIAL_RECOVERY_DELAY_MS * Math.pow(2, this.recoveryAttempts);
+    this.recoveryAttempts += 1;
+    console.log(`[SystemAudio] Scheduling recovery attempt ${this.recoveryAttempts}/${MAX_RECOVERY_ATTEMPTS} in ${delay}ms`);
+    this.emit('recovery-scheduled', { attempt: this.recoveryAttempts, maxAttempts: MAX_RECOVERY_ATTEMPTS, delayMs: delay });
+
+    this.recoveryTimer = setTimeout(async () => {
+      this.recoveryTimer = null;
+      if (!this.recoveryEnabled) {
+        return;
+      }
+      console.log(`[SystemAudio] Attempting recovery ${this.recoveryAttempts}/${MAX_RECOVERY_ATTEMPTS}`);
+      const ok = await this.start(this.lastStartOptions);
+      // Re-check after await: stop() may have run during start(), disabling
+      // recovery. If so, tear down the just-started capture to avoid
+      // resurrecting system audio after an intentional stop.
+      if (!this.recoveryEnabled) {
+        if (ok) {
+          await this.stop();
+        }
+        return;
+      }
+      if (ok) {
+        console.log('[SystemAudio] Recovery successful');
+        this.recoveryAttempts = 0;
+        this.emit('recovery-succeeded');
+      } else {
+        // start() returned false without throwing (e.g. permission denied).
+        // The audioTee error handler won't fire, so reschedule explicitly.
+        this.scheduleRecovery();
+      }
+    }, delay);
   }
 
   private isSilent(pcm: Buffer): boolean {
