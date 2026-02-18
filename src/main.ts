@@ -360,8 +360,13 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
     }
-    mainWindow?.show();
-    mainWindow?.focus();
+    // Only bring the window forward if it's currently hidden.
+    // Unconditional show()+focus() causes macOS to switch Spaces/Desktops
+    // when the app is activated via widget clicks or system events.
+    if (mainWindow && !mainWindow.isVisible()) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
   });
 });
 
