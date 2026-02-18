@@ -176,11 +176,11 @@ export class OpenAIRealtimeClient extends EventEmitter {
     }
     await this.sendQueue;
 
-    // Send ~300ms of trailing silence (PCM16 zeros) before committing.
-    // At 24kHz mono PCM16, 300ms = 7200 samples = 14400 bytes.
+    // Send ~500ms of trailing silence (PCM16 zeros) before committing.
+    // At 24kHz mono PCM16, 500ms = 12000 samples = 24000 bytes.
     // This prevents OpenAI from truncating the final word/syllable when
     // turn_detection is null (single mode) and audio ends abruptly.
-    const silenceBytes = 14400;
+    const silenceBytes = 24000;
     const silence = Buffer.alloc(silenceBytes, 0);
     await this.enqueueSend(
       JSON.stringify({
@@ -422,7 +422,8 @@ export class OpenAIRealtimeClient extends EventEmitter {
     }
 
     if (type === 'response.text.delta' || type === 'response.output_text.delta') {
-      if (this.sessionMode === 'meeting') {
+      // In pure transcription mode (no instructions), ignore assistant response events.
+      if (this.sessionMode === 'meeting' || !this.hasInstructions()) {
         return;
       }
       const delta = String((data as { delta?: string }).delta || '');
@@ -434,7 +435,8 @@ export class OpenAIRealtimeClient extends EventEmitter {
     }
 
     if (type === 'response.done' || type === 'response.text.done' || type === 'response.output_text.done') {
-      if (this.sessionMode === 'meeting') {
+      // In pure transcription mode (no instructions), ignore assistant response events.
+      if (this.sessionMode === 'meeting' || !this.hasInstructions()) {
         return;
       }
       this.handleResponseDone();

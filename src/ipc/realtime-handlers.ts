@@ -5,6 +5,25 @@ import { mixPcmBuffers } from '../audio-mixer';
 import { IpcDependencies } from './types';
 
 export function registerRealtimeHandlers(deps: IpcDependencies): void {
+  let audioIngressQueue: Promise<void> = Promise.resolve();
+  let lastAudioIngressAt = 0;
+
+  const enqueueAudioForward = (task: () => Promise<void>): void => {
+    audioIngressQueue = audioIngressQueue.then(task, task);
+  };
+
+  const waitForAudioIngressToSettle = async (settleMs: number = 80, maxWaitMs: number = 1200): Promise<void> => {
+    const start = Date.now();
+    while (true) {
+      await audioIngressQueue;
+      const idleFor = Date.now() - lastAudioIngressAt;
+      if (idleFor >= settleMs || Date.now() - start >= maxWaitMs) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+
   ipcMain.handle('openai-realtime-start', async (_event, payload?: { meetingMode?: boolean }) => {
     const apiKey = deps.configManager.getApiKey('openai');
     if (!apiKey) {
@@ -23,10 +42,10 @@ export function registerRealtimeHandlers(deps: IpcDependencies): void {
     const language = settings.language || 'en';
     const customPrompt = (settings.customTranscriptionPrompt || '').trim();
     const prompt = customPrompt || LIVE_TRANSCRIPTION_PROMPT;
-    const openAIClient = new OpenAIRealtimeClient(apiKey, undefined, undefined, {
-      single: prompt,
-      meeting: prompt,
-    }, language);
+    // Single live dictation uses prompt-guided transcription; meeting mode remains pure ASR.
+    const openAIClient = new OpenAIRealtimeClient(apiKey, undefined, undefined, { single: prompt }, language);
+    audioIngressQueue = Promise.resolve();
+    lastAudioIngressAt = 0;
     openAIClient.on('status', (status: string) => {
       deps.sendRealtimeEvent({ type: 'status', status });
     });
@@ -56,28 +75,32 @@ export function registerRealtimeHandlers(deps: IpcDependencies): void {
   });
 
   ipcMain.on('openai-realtime-audio', (_event, audio: ArrayBuffer | Buffer) => {
-    const openAIClient = deps.getOpenAIClient();
-    if (!openAIClient) {
-      return;
-    }
+    lastAudioIngressAt = Date.now();
     const micBuffer = Buffer.isBuffer(audio) ? audio : Buffer.from(new Uint8Array(audio));
-    if (!deps.getRealtimeMeetingMode()) {
-      void openAIClient.sendAudio(micBuffer);
-      return;
-    }
+    enqueueAudioForward(async () => {
+      const openAIClient = deps.getOpenAIClient();
+      if (!openAIClient) {
+        return;
+      }
+      if (!deps.getRealtimeMeetingMode()) {
+        await openAIClient.sendAudio(micBuffer);
+        return;
+      }
 
-    // Dequeue one system audio chunk per mic frame for temporal alignment.
-    // If no system chunk available, mix with silence (null).
-    const systemAudioQueue = deps.getSystemAudioQueue();
-    const systemChunk = systemAudioQueue.shift() ?? null;
-    const mixed = mixPcmBuffers(micBuffer, systemChunk);
-    void openAIClient.sendAudio(mixed.length > 0 ? mixed : micBuffer);
+      // Dequeue one system audio chunk per mic frame for temporal alignment.
+      // If no system chunk available, mix with silence (null).
+      const systemAudioQueue = deps.getSystemAudioQueue();
+      const systemChunk = systemAudioQueue.shift() ?? null;
+      const mixed = mixPcmBuffers(micBuffer, systemChunk);
+      await openAIClient.sendAudio(mixed.length > 0 ? mixed : micBuffer);
+    });
   });
 
   ipcMain.handle('openai-realtime-stop', async (_event, payload?: { meetingMode?: boolean }) => {
     const isMeeting = Boolean(payload?.meetingMode) || deps.getRealtimeMeetingMode();
     const openAIClient = deps.getOpenAIClient();
     if (openAIClient) {
+      await waitForAudioIngressToSettle();
       if (isMeeting) {
         const transcript = await openAIClient.stopMeeting();
         await deps.stopSystemAudioCapture();
@@ -92,6 +115,8 @@ export function registerRealtimeHandlers(deps: IpcDependencies): void {
   ipcMain.handle('openai-realtime-disconnect', async () => {
     deps.setRealtimeMeetingMode(false);
     await deps.stopSystemAudioCapture();
+    audioIngressQueue = Promise.resolve();
+    lastAudioIngressAt = 0;
     const openAIClient = deps.getOpenAIClient();
     if (openAIClient) {
       await openAIClient.disconnect();

@@ -332,8 +332,21 @@ describe('OpenAIRealtimeClient', () => {
     expect(client.getMeetingSegments()).toEqual(['actual spoken transcript']);
   });
 
-  it('still handles response events in single mode', async () => {
+  it('ignores response events in single mode when instructions are not set', async () => {
     const client = new OpenAIRealtimeClient('test-key');
+    const ws = await connectClient(client, 'single');
+    const textHandler = vi.fn();
+
+    client.on('text', textHandler);
+
+    ws.emit('message', Buffer.from(JSON.stringify({ type: 'response.text.delta', delta: 'hello' })));
+    ws.emit('message', Buffer.from(JSON.stringify({ type: 'response.done' })));
+
+    expect(textHandler).not.toHaveBeenCalled();
+  });
+
+  it('still handles response events in single mode when instructions are set', async () => {
+    const client = new OpenAIRealtimeClient('test-key', 'test-model', 'gpt-4o-transcribe', 'prompt');
     const ws = await connectClient(client, 'single');
     const textHandler = vi.fn();
 
