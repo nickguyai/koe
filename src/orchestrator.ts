@@ -1,4 +1,4 @@
-import { ipcMain, BrowserWindow } from 'electron';
+import { ipcMain, BrowserWindow, app } from 'electron';
 import { getStateMachine, RecordingState } from './state-machine';
 import { getHotkeyService } from './hotkey-service';
 import { getTextInsertionService } from './text-insertion-service';
@@ -257,6 +257,8 @@ export class Orchestrator {
           await textInsertionService.captureActiveApp();
         }
 
+        this.hideMainWindowIfBackground();
+
         stateMachine.transition('hotkey_press');
         this.isRecording = true;
       } else if (stateMachine.currentState === 'recording') {
@@ -271,6 +273,7 @@ export class Orchestrator {
         if (!this.isMeetingModeEnabled) {
           await textInsertionService.captureActiveApp();
         }
+        this.hideMainWindowIfBackground();
         stateMachine.transition('hotkey_press');
         this.isRecording = true;
       } else {
@@ -298,6 +301,7 @@ export class Orchestrator {
         if (!this.isMeetingModeEnabled) {
           await textInsertionService.captureActiveApp();
         }
+        this.hideMainWindowIfBackground();
         stateMachine.transition('hotkey_press');
         this.isRecording = true;
       } else if (stateMachine.currentState === 'recording' || stateMachine.currentState === 'meeting_recording') {
@@ -452,6 +456,29 @@ export class Orchestrator {
         return this.isMeetingModeEnabled;
       },
     );
+  }
+
+  /**
+   * macOS: hide the main window when recording starts from another app.
+   * Keeping a visible Koe window on a different Space can pull the user back
+   * if macOS activates Koe during post-recording system events.
+   */
+  private hideMainWindowIfBackground(): void {
+    if (process.platform !== 'darwin') {
+      return;
+    }
+
+    const win = this.mainWindow;
+    if (!win || win.isDestroyed()) {
+      return;
+    }
+
+    if (!win.isVisible() || win.isFocused()) {
+      return;
+    }
+
+    win.hide();
+    app.dock?.show();
   }
 
   /**

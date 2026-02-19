@@ -11,6 +11,7 @@ const {
   mockConfigService,
   mockPermissionService,
   mockSystemAudioService,
+  mockElectronApp,
 } = vi.hoisted(() => {
   const capturedHandlers: Record<string, Function> = {};
 
@@ -87,12 +88,18 @@ const {
       start: vi.fn().mockResolvedValue(true),
       stop: vi.fn().mockResolvedValue(undefined),
     },
+    mockElectronApp: {
+      dock: {
+        show: vi.fn(),
+      },
+    },
   };
 });
 
 vi.mock('electron', () => ({
   ipcMain: mockIpcMain,
   BrowserWindow: vi.fn(),
+  app: mockElectronApp,
 }));
 
 vi.mock('../state-machine', () => ({
@@ -329,5 +336,58 @@ describe('Orchestrator meeting detection monitor gating', () => {
     await handler({}, true);
 
     expect(mockConfigService.setMeetingDetectionEnabled).toHaveBeenCalledWith(true);
+  });
+});
+
+describe('Orchestrator desktop switching guard', () => {
+  let orchestrator: Orchestrator;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.keys(ipcHandlers).forEach((k) => delete ipcHandlers[k]);
+    mockStateMachine.currentState = 'idle';
+    orchestrator = new Orchestrator();
+  });
+
+  it('hides visible background main window before starting recording', async () => {
+    const hide = vi.fn();
+    const mainWindow = {
+      isDestroyed: vi.fn(() => false),
+      isVisible: vi.fn(() => true),
+      isFocused: vi.fn(() => false),
+      hide,
+      webContents: {
+        on: vi.fn(),
+      },
+    } as unknown as Parameters<Orchestrator['initialize']>[0];
+
+    orchestrator.initialize(mainWindow, '/tmp/realtime.html');
+
+    const hotkeyPress = mockHotkeyService.onPress.mock.calls[0]?.[0] as (() => Promise<void>) | undefined;
+    expect(hotkeyPress).toBeDefined();
+    await hotkeyPress!();
+
+    expect(hide).toHaveBeenCalled();
+  });
+
+  it('does not hide window if Koe is already focused', async () => {
+    const hide = vi.fn();
+    const mainWindow = {
+      isDestroyed: vi.fn(() => false),
+      isVisible: vi.fn(() => true),
+      isFocused: vi.fn(() => true),
+      hide,
+      webContents: {
+        on: vi.fn(),
+      },
+    } as unknown as Parameters<Orchestrator['initialize']>[0];
+
+    orchestrator.initialize(mainWindow, '/tmp/realtime.html');
+
+    const hotkeyPress = mockHotkeyService.onPress.mock.calls[0]?.[0] as (() => Promise<void>) | undefined;
+    expect(hotkeyPress).toBeDefined();
+    await hotkeyPress!();
+
+    expect(hide).not.toHaveBeenCalled();
   });
 });

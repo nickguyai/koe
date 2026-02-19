@@ -51,6 +51,16 @@ export class FloatingIndicator {
     // Prevent the window from being focused
     win.setIgnoreMouseEvents(true, { forward: true });
 
+    // macOS: visible on all Spaces including fullscreen apps to prevent Space switching
+    // when recording while in fullscreen. Uses NSWindowCollectionBehavior.canJoinAllSpaces
+    // and .fullScreenAuxiliary via Electron's setVisibleOnAllWorkspaces.
+    // Ref: https://developer.apple.com/documentation/appkit/nswindowcollectionbehavior
+    // Ref: https://www.electronjs.org/docs/latest/api/browser-window#winsetvisibleonallworkspacesvisible-options
+    if (process.platform === 'darwin') {
+      win.setAlwaysOnTop(true, 'screen-saver');
+      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    }
+
     // Load inline HTML directly (no external file needed)
     win.loadURL(`data:text/html,${encodeURIComponent(this.getInlineHTML())}`);
 

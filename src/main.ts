@@ -33,6 +33,27 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isAppQuitting = false;
 
+/**
+ * Show the main window on the user's current Space without forcing a Space switch.
+ * On macOS, briefly sets the window to be visible on all workspaces, shows it,
+ * then removes it from other Spaces. This moves the window to the current Space.
+ * Ref: https://developer.apple.com/documentation/appkit/nswindowcollectionbehavior
+ * Ref: https://www.electronjs.org/docs/latest/api/browser-window#winsetvisibleonallworkspacesvisible-options
+ */
+function showMainWindowOnCurrentSpace(): void {
+  if (!mainWindow) return;
+  if (process.platform === 'darwin') {
+    // Temporarily make visible on all Spaces, show, then restrict to current Space
+    mainWindow.setVisibleOnAllWorkspaces(true);
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.setVisibleOnAllWorkspaces(false);
+  } else {
+    mainWindow.show();
+    mainWindow.focus();
+  }
+}
+
 let configManager: ConfigManager | null = null;
 let geminiTranscriber: GeminiTranscriber | null = null;
 let jobQueue: TranscriptionJobQueue | null = null;
@@ -240,8 +261,7 @@ function createTray(): void {
     {
       label: 'Show Window',
       click: () => {
-        mainWindow?.show();
-        mainWindow?.focus();
+        showMainWindowOnCurrentSpace();
       },
     },
     {
@@ -267,8 +287,7 @@ function createTray(): void {
       mainWindow.hide();
       app.dock?.show();
     } else {
-      mainWindow?.show();
-      mainWindow?.focus();
+      showMainWindowOnCurrentSpace();
     }
   });
 }
@@ -330,8 +349,7 @@ app.whenReady().then(async () => {
       {
         label: 'Show Window',
         click: () => {
-          mainWindow?.show();
-          mainWindow?.focus();
+          showMainWindowOnCurrentSpace();
         },
       },
       { type: 'separator' },
@@ -357,15 +375,14 @@ app.whenReady().then(async () => {
   mainWindow?.show();
 
   app.on('activate', () => {
+    // Only recreate the window if all windows are closed.
+    // DO NOT call show()/focus() here - the 'activate' event fires AFTER macOS
+    // has already activated the app. Any show()/focus() call here can force
+    // a Space switch if the main window is on another Space.
+    // Users should use tray menu, dock menu, or tray click to show the window.
+    // Ref: https://developer.apple.com/documentation/appkit/nswindowcollectionbehavior
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
-    }
-    // Only bring the window forward if it's currently hidden.
-    // Unconditional show()+focus() causes macOS to switch Spaces/Desktops
-    // when the app is activated via widget clicks or system events.
-    if (mainWindow && !mainWindow.isVisible()) {
-      mainWindow.show();
-      mainWindow.focus();
     }
   });
 });
