@@ -6,6 +6,17 @@ import { IpcDependencies } from './types';
 import { getAudioMimeType } from './utils';
 
 export function registerJobHandlers(deps: IpcDependencies): void {
+  const shouldRunConsensusForOpenAILive = (provider: string, isMeetingMode: boolean, hasAudio: boolean): boolean => {
+    if (isMeetingMode || !hasAudio) {
+      return false;
+    }
+    const normalizedProvider = String(provider || '').trim().toLowerCase();
+    if (normalizedProvider !== 'openai') {
+      return false;
+    }
+    return deps.configManager.getSettings().consensusEnabled === true;
+  };
+
   ipcMain.handle('transcription-job-enqueue', async (_event, payload: { path?: string; name?: string; bytes?: ArrayBuffer }) => {
     if (payload?.path) {
       return deps.jobQueue.enqueueFromPath(payload.path, payload.name);
@@ -53,6 +64,18 @@ export function registerJobHandlers(deps: IpcDependencies): void {
       }
 
       const isMeetingMode = Boolean(payload?.meetingMode);
+      const shouldUseConsensus = shouldRunConsensusForOpenAILive(
+        existing.provider || 'openai',
+        isMeetingMode,
+        Boolean(existing.audio_path),
+      );
+      if (shouldUseConsensus) {
+        // Live OpenAI mode can stream a fast preview text, but when consensus is
+        // enabled we re-transcribe from saved audio through the queued consensus path.
+        const queued = deps.jobQueue.retranscribeJob(jobId);
+        return { job: queued };
+      }
+
       const meetingNotes = payload?.meetingNotes;
       const diarizationStatus = isMeetingMode && existing.audio_path ? 'pending' : undefined;
       const completed = deps.jobQueue.completeAudioOnlyJob(
@@ -99,6 +122,19 @@ export function registerJobHandlers(deps: IpcDependencies): void {
       const provider = payload?.provider || 'openai';
       const audioBuffer = payload?.audioBytes ? Buffer.from(new Uint8Array(payload.audioBytes)) : undefined;
       const isMeetingMode = Boolean(payload?.meetingMode);
+      const shouldUseConsensus = shouldRunConsensusForOpenAILive(
+        provider,
+        isMeetingMode,
+        Boolean(audioBuffer && audioBuffer.length > 0),
+      );
+      if (shouldUseConsensus && audioBuffer) {
+        // Fallback live save path: create an audio-only job and route it through
+        // the queue so consensus can execute with the same logic as batch jobs.
+        const seeded = deps.jobQueue.createAudioOnlyJob(provider, audioBuffer, payload?.duration);
+        const queued = deps.jobQueue.retranscribeJob(seeded.id);
+        return { job: queued };
+      }
+
       const meetingNotes = payload?.meetingNotes;
       const diarizationStatus = isMeetingMode && audioBuffer && audioBuffer.length > 0 ? 'pending' : undefined;
 

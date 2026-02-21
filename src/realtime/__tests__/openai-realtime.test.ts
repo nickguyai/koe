@@ -108,7 +108,7 @@ describe('OpenAIRealtimeClient', () => {
     MockWebSocket.instances.length = 0;
   });
 
-  it('uses instructions and omits input_audio_transcription when instructions are provided', async () => {
+  it('uses instructions and keeps input_audio_transcription when instructions are provided', async () => {
     const client = new OpenAIRealtimeClient('test-key', 'test-model', 'gpt-4o-transcribe', 'Follow this prompt');
     const ws = await connectClient(client, 'single');
 
@@ -117,7 +117,7 @@ describe('OpenAIRealtimeClient', () => {
 
     const session = (sessionUpdate!.session || {}) as Record<string, unknown>;
     expect(session.instructions).toBe('Follow this prompt');
-    expect(session.input_audio_transcription).toBeUndefined();
+    expect(session.input_audio_transcription).toEqual({ model: 'gpt-4o-transcribe' });
     expect(session.turn_detection).toBeNull();
   });
 
@@ -131,6 +131,7 @@ describe('OpenAIRealtimeClient', () => {
     expect(singleSessionUpdate).toBeDefined();
     const singleSession = (singleSessionUpdate!.session || {}) as Record<string, unknown>;
     expect(singleSession.instructions).toBe('Single dictation prompt');
+    expect(singleSession.input_audio_transcription).toEqual({ model: 'gpt-4o-transcribe' });
 
     await client.disconnect();
 
@@ -345,7 +346,7 @@ describe('OpenAIRealtimeClient', () => {
     expect(textHandler).not.toHaveBeenCalled();
   });
 
-  it('still handles response events in single mode when instructions are set', async () => {
+  it('buffers unmarked response text until done in single mode when instructions are set', async () => {
     const client = new OpenAIRealtimeClient('test-key', 'test-model', 'gpt-4o-transcribe', 'prompt');
     const ws = await connectClient(client, 'single');
     const textHandler = vi.fn();
@@ -353,10 +354,11 @@ describe('OpenAIRealtimeClient', () => {
     client.on('text', textHandler);
 
     ws.emit('message', Buffer.from(JSON.stringify({ type: 'response.text.delta', delta: 'hello' })));
+    expect(textHandler).not.toHaveBeenCalled();
     ws.emit('message', Buffer.from(JSON.stringify({ type: 'response.done' })));
 
-    expect(textHandler).toHaveBeenNthCalledWith(1, { content: 'hello', isNewResponse: false });
-    expect(textHandler).toHaveBeenNthCalledWith(2, { content: 'hello', isNewResponse: true });
+    expect(textHandler).toHaveBeenCalledTimes(1);
+    expect(textHandler).toHaveBeenNthCalledWith(1, { content: 'hello', isNewResponse: true });
   });
 
   // Guard: LIVE_TRANSCRIPTION_PROMPT must always be sent for both single and meeting modes.
@@ -371,7 +373,7 @@ describe('OpenAIRealtimeClient', () => {
 
     const session = (sessionUpdate!.session || {}) as Record<string, unknown>;
     expect(session.instructions).toBe(LIVE_TRANSCRIPTION_PROMPT);
-    expect(session.input_audio_transcription).toBeUndefined();
+    expect(session.input_audio_transcription).toEqual({ model: 'gpt-4o-transcribe' });
   });
 
   it('LIVE_TRANSCRIPTION_PROMPT is sent in meeting mode when provided', async () => {
@@ -386,7 +388,7 @@ describe('OpenAIRealtimeClient', () => {
 
     const session = (sessionUpdate!.session || {}) as Record<string, unknown>;
     expect(session.instructions).toBe(LIVE_TRANSCRIPTION_PROMPT);
-    expect(session.input_audio_transcription).toBeUndefined();
+    expect(session.input_audio_transcription).toEqual({ model: 'gpt-4o-transcribe' });
   });
 
   it('passes language to session config with LIVE_TRANSCRIPTION_PROMPT', async () => {
@@ -397,8 +399,63 @@ describe('OpenAIRealtimeClient', () => {
 
     const sessionUpdate = firstMessageByType(ws, 'session.update');
     const session = (sessionUpdate!.session || {}) as Record<string, unknown>;
-    // With instructions, language is not set via input_audio_transcription
-    // but the prompt itself handles language via its rules
     expect(session.instructions).toBe(LIVE_TRANSCRIPTION_PROMPT);
+    expect(session.input_audio_transcription).toEqual({ model: 'gpt-4o-transcribe', language: 'ja' });
+  });
+
+  it('strips brainwave marker prefix from response output', async () => {
+    const client = new OpenAIRealtimeClient('test-key', 'test-model', 'gpt-4o-transcribe', 'prompt');
+    const ws = await connectClient(client, 'single');
+    const textHandler = vi.fn();
+
+    client.on('text', textHandler);
+
+    ws.emit(
+      'message',
+      Buffer.from(
+        JSON.stringify({
+          type: 'response.text.delta',
+          delta: '下面是不改变语言的语音识别结果：\n\nhello world',
+        }),
+      ),
+    );
+    ws.emit('message', Buffer.from(JSON.stringify({ type: 'response.done' })));
+
+    expect(textHandler).toHaveBeenNthCalledWith(1, { content: 'hello world', isNewResponse: false });
+    expect(textHandler).toHaveBeenNthCalledWith(2, { content: 'hello world', isNewResponse: true });
+  });
+
+  it('falls back to ASR transcript when unmarked response looks conversational', async () => {
+    const client = new OpenAIRealtimeClient('test-key', 'test-model', 'gpt-4o-transcribe', 'prompt');
+    const ws = await connectClient(client, 'single');
+    const textHandler = vi.fn();
+
+    client.on('text', textHandler);
+
+    ws.emit(
+      'message',
+      Buffer.from(
+        JSON.stringify({
+          type: 'conversation.item.input_audio_transcription.completed',
+          transcript: 'book a meeting tomorrow at 3 PM',
+        }),
+      ),
+    );
+    ws.emit(
+      'message',
+      Buffer.from(
+        JSON.stringify({
+          type: 'response.text.delta',
+          delta: "I'm sorry, but I can only transcribe spoken words. Please provide the speech you want transcribed.",
+        }),
+      ),
+    );
+    ws.emit('message', Buffer.from(JSON.stringify({ type: 'response.done' })));
+
+    expect(textHandler).toHaveBeenCalledTimes(1);
+    expect(textHandler).toHaveBeenNthCalledWith(1, {
+      content: 'book a meeting tomorrow at 3 PM',
+      isNewResponse: true,
+    });
   });
 });

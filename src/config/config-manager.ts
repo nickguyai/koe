@@ -30,7 +30,6 @@ export interface AppSettings {
   autoPolish: boolean;
   polishStyle: string;
   customPolishPrompt: string;
-  customTranscriptionPrompt: string;
   consensusEnabled: boolean;
   consensusMemoryEnabled: boolean;
   meetingCaptureEnabled: boolean;
@@ -65,7 +64,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoPolish: false,
   polishStyle: 'natural',
   customPolishPrompt: '',
-  customTranscriptionPrompt: '',
   consensusEnabled: false,
   consensusMemoryEnabled: true,
   meetingCaptureEnabled: false,
@@ -90,7 +88,9 @@ export class ConfigManager {
     if (fs.existsSync(this.settingsPath)) {
       try {
         const raw = fs.readFileSync(this.settingsPath, 'utf-8');
-        fromDisk = JSON.parse(raw) as Partial<AppSettings>;
+        const parsed = JSON.parse(raw) as Partial<AppSettings> & { customTranscriptionPrompt?: unknown };
+        const { customTranscriptionPrompt: _legacyCustomTranscriptionPrompt, ...sanitized } = parsed;
+        fromDisk = sanitized as Partial<AppSettings>;
       } catch (err) {
         console.warn('Failed to read settings.json, using defaults:', err);
       }
@@ -153,15 +153,20 @@ export class ConfigManager {
   }
 
   updateSettings(partial: Partial<AppSettings>): AppSettings {
+    const sanitizedPartial = {
+      ...partial,
+    } as Partial<AppSettings> & { customTranscriptionPrompt?: unknown };
+    delete sanitizedPartial.customTranscriptionPrompt;
+
     const next: AppSettings = {
       ...this.settings,
-      ...partial,
+      ...sanitizedPartial,
     };
-    if (partial.hotkey) {
-      next.hotkey = this.sanitizeHotkey(partial.hotkey);
+    if (sanitizedPartial.hotkey) {
+      next.hotkey = this.sanitizeHotkey(sanitizedPartial.hotkey);
     }
-    if (partial.speakerLabels) {
-      next.speakerLabels = this.sanitizeSpeakerLabels(partial.speakerLabels as unknown as Record<string, unknown>);
+    if (sanitizedPartial.speakerLabels) {
+      next.speakerLabels = this.sanitizeSpeakerLabels(sanitizedPartial.speakerLabels as unknown as Record<string, unknown>);
     }
     this.settings = next;
     this.saveSettings(this.settings);

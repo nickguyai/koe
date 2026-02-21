@@ -210,7 +210,6 @@ export class GeminiTranscriber {
       punctuation: settings.punctuation,
       language: settings.language,
       summaryLength: settings.summaryLength,
-      customTranscriptionPrompt: settings.customTranscriptionPrompt,
       knownSpeakerNames,
     });
 
@@ -261,15 +260,8 @@ export class GeminiTranscriber {
       punctuation: settings.punctuation,
       language: settings.language,
       summaryLength: settings.summaryLength,
-      customTranscriptionPrompt: settings.customTranscriptionPrompt,
       knownSpeakerNames: this.getKnownSpeakerNames(settings.speakerLabels),
     };
-
-    if (promptSettings.customTranscriptionPrompt?.trim()) {
-      console.warn(
-        '[GeminiTranscriber] Custom transcription prompt is set — chunk context (index, offset, previous speakers) will not be injected into the prompt.',
-      );
-    }
 
     const allSegments: SpeechSegment[] = [];
     let allTitles: string[] = [];

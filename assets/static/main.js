@@ -82,7 +82,6 @@ let settings = {
     customPolishPrompt: '',
     defaultMode: 'gemini',
     geminiModel: 'gemini-3-flash-preview',
-    customTranscriptionPrompt: '',
     consensusEnabled: false,
     consensusMemoryEnabled: true,
     meetingCaptureEnabled: false,
@@ -380,9 +379,6 @@ const liveTranscriptPinToggle = document.getElementById('liveTranscriptPinToggle
 // Polish Settings
 const polishStyleSelect = document.getElementById('polishStyleSelect');
 const customPolishPrompt = document.getElementById('customPolishPrompt');
-
-// Model and Advanced Settings
-const customTranscriptionPrompt = document.getElementById('customTranscriptionPrompt');
 
 // Hotkey Settings
 const hotkeyInput = document.getElementById('hotkeyInput');
@@ -2381,6 +2377,13 @@ async function persistLiveTranscription(text, options = {}) {
             renderLibrary();
         }
 
+        if (!result && (job.status === 'pending' || job.status === 'processing')) {
+            pollJobUntilDone(job.id, {
+                sendToMain: false,
+                completionToast: 'Consensus transcription complete'
+            });
+        }
+
         if (job.diarization_status === 'pending' || job.diarization_status === 'processing') {
             pollDiarizationUntilDone(job.id);
         }
@@ -3772,18 +3775,6 @@ function setupSettingsListeners() {
         });
     }
 
-    // Custom transcription prompt
-    if (customTranscriptionPrompt) {
-        let debounceTimer;
-        customTranscriptionPrompt.addEventListener('input', () => {
-            settings.customTranscriptionPrompt = customTranscriptionPrompt.value;
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-                api.setSettings({ customTranscriptionPrompt: settings.customTranscriptionPrompt });
-            }, 1000);
-        });
-    }
-
     // Fn key tip card dismiss
     const fnKeyTip = document.getElementById('fnKeyTip');
     const fnKeyTipDismiss = document.getElementById('fnKeyTipDismiss');
@@ -4000,7 +3991,6 @@ async function saveSettings() {
         customPolishPrompt: settings.customPolishPrompt,
         defaultProvider: settings.defaultMode,
         geminiModel: settings.geminiModel,
-        customTranscriptionPrompt: settings.customTranscriptionPrompt,
         meetingCaptureEnabled: settings.meetingCaptureEnabled,
         meetingNotesModel: settings.meetingNotesModel,
         hotkey: settings.hotkey,
@@ -4187,12 +4177,6 @@ async function loadSettings() {
         }
         if (meetingNotesModelSelect) {
             meetingNotesModelSelect.value = settings.meetingNotesModel;
-        }
-
-        // Apply custom transcription prompt
-        settings.customTranscriptionPrompt = data.customTranscriptionPrompt || '';
-        if (customTranscriptionPrompt) {
-            customTranscriptionPrompt.value = settings.customTranscriptionPrompt;
         }
 
         // Load hotkey from Electron (source of truth) or fall back to settings.json

@@ -29,13 +29,15 @@ export class OpenAITranscriber {
 
   private async convertToWavIfNeeded(audioPath: string): Promise<{ path: string; cleanup?: () => Promise<void> }> {
     const ext = path.extname(audioPath).toLowerCase();
-    // GPT-4o audio supports wav, mp3, flac, m4a, mp4, mpeg, mpga, oga, ogg, webm
-    const supportedFormats = ['.wav', '.mp3', '.flac', '.m4a', '.mp4', '.mpeg', '.mpga', '.oga', '.ogg', '.webm'];
-    if (supportedFormats.includes(ext)) {
+    // Chat Completions input_audio accepts wav/mp3 payload labeling.
+    // Normalize everything else to wav to avoid mismatched format/data errors.
+    if (ext === '.wav' || ext === '.mp3') {
       return { path: audioPath };
     }
 
-    const convertedPath = audioPath.replace(new RegExp(`\\${ext}$`, 'i'), '_converted.wav');
+    const convertedPath = ext
+      ? audioPath.replace(new RegExp(`\\${ext}$`, 'i'), '_converted.wav')
+      : `${audioPath}_converted.wav`;
 
     const conversionOk = await new Promise<boolean>((resolve) => {
       const child = spawn(getFfmpegPath(), ['-y', '-i', audioPath, '-ar', '16000', '-ac', '1', convertedPath], {
@@ -53,7 +55,7 @@ export class OpenAITranscriber {
     });
 
     if (!conversionOk) {
-      return { path: audioPath };
+      throw new Error(`Failed to convert audio to wav for OpenAI transcription: ${audioPath}`);
     }
 
     return {
@@ -143,9 +145,13 @@ export class OpenAITranscriber {
 
     const { path: workingPath, cleanup } = await this.convertToWavIfNeeded(audioPath);
     try {
+      const ext = path.extname(workingPath).toLowerCase();
+      if (ext !== '.wav' && ext !== '.mp3') {
+        throw new Error(`OpenAI transcription requires wav/mp3 input, got: ${workingPath}`);
+      }
       const audioBytes = await fs.promises.readFile(workingPath);
       const base64Audio = audioBytes.toString('base64');
-      const mimeType = this.guessMimeType(workingPath);
+      const audioFormat = ext === '.wav' ? 'wav' : 'mp3';
 
       const response = await client.chat.completions.create({
         model: 'gpt-4o-audio-preview',
@@ -159,7 +165,7 @@ export class OpenAITranscriber {
                 type: 'input_audio',
                 input_audio: {
                   data: base64Audio,
-                  format: mimeType === 'audio/wav' ? 'wav' : 'mp3',
+                  format: audioFormat,
                 },
               },
             ],

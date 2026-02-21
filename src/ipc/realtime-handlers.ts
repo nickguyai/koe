@@ -40,10 +40,14 @@ export function registerRealtimeHandlers(deps: IpcDependencies): void {
 
     const settings = deps.configManager.getSettings();
     const language = settings.language || 'en';
-    const customPrompt = (settings.customTranscriptionPrompt || '').trim();
-    const prompt = customPrompt || LIVE_TRANSCRIPTION_PROMPT;
-    // Single live dictation uses prompt-guided transcription; meeting mode remains pure ASR.
-    const openAIClient = new OpenAIRealtimeClient(apiKey, undefined, undefined, { single: prompt }, language);
+    // Realtime dictation is pinned to the Brainwave prompt/workflow for stability.
+    const openAIClient = new OpenAIRealtimeClient(
+      apiKey,
+      undefined,
+      undefined,
+      { single: LIVE_TRANSCRIPTION_PROMPT },
+      language,
+    );
     audioIngressQueue = Promise.resolve();
     lastAudioIngressAt = 0;
     openAIClient.on('status', (status: string) => {

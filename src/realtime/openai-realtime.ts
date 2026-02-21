@@ -19,6 +19,15 @@ export interface RealtimeStructuredEvent {
   result: Record<string, unknown>;
 }
 
+const BRAINWAVE_MARKER_PREFIX = '下面是不改变语言的语音识别结果：\n\n';
+const CONVERSATIONAL_RESPONSE_PATTERNS = [
+  /\bI can only transcribe\b/i,
+  /\bPlease provide (the )?speech\b/i,
+  /\bI('m| am) sorry\b/i,
+  /\bas an AI\b/i,
+  /^\s*(sure|ok|okay|of course)\b/i,
+];
+
 export class OpenAIRealtimeClient extends EventEmitter {
   private apiKey: string;
   private model: string;
@@ -32,6 +41,10 @@ export class OpenAIRealtimeClient extends EventEmitter {
   private pendingAudio: Buffer[] = [];
   private sendQueue: Promise<void> = Promise.resolve();
   private currentResponseText = '';
+  private responsePrefixBuffer: string[] = [];
+  private markerSeen = false;
+  private markerMatched = false;
+  private singleAsrSegments: string[] = [];
   private readyResolver: (() => void) | null = null;
   private readyRejecter: ((err: Error) => void) | null = null;
   private readyPromise: Promise<void> | null = null;
@@ -64,6 +77,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
 
   async connect(mode: SessionMode = 'single'): Promise<void> {
     this.sessionMode = mode;
+    this.resetSingleResponseState();
 
     if (this.disconnectPromise) {
       await this.disconnectPromise;
@@ -193,6 +207,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
     this.commitAudioAt = Date.now();
     await this.enqueueSend(JSON.stringify({ type: 'input_audio_buffer.commit' }));
     if (this.sessionMode === 'single' && this.hasInstructions()) {
+      this.resetSingleResponseState();
       await this.enqueueSend(JSON.stringify({ type: 'response.create' }));
     }
   }
@@ -288,16 +303,15 @@ export class OpenAIRealtimeClient extends EventEmitter {
       modalities: ['text'],
       input_audio_format: 'pcm16',
       turn_detection: turnDetection,
+      input_audio_transcription: {
+        model: this.transcriptionModel,
+        ...(this.language ? { language: this.language } : {}),
+      },
     };
 
     const activeInstructions = this.getCurrentInstructions();
     if (activeInstructions) {
       session.instructions = activeInstructions;
-    } else {
-      session.input_audio_transcription = {
-        model: this.transcriptionModel,
-        ...(this.language ? { language: this.language } : {}),
-      };
     }
 
     await this.enqueueSend(
@@ -396,7 +410,17 @@ export class OpenAIRealtimeClient extends EventEmitter {
       return;
     }
 
+    if (type === 'response.created') {
+      if (this.sessionMode === 'single' && this.hasInstructions()) {
+        this.resetSingleResponseState();
+      }
+      return;
+    }
+
     if (type === 'conversation.item.input_audio_transcription.delta') {
+      if (this.sessionMode === 'single' && this.hasInstructions()) {
+        return;
+      }
       const delta = String((data as { delta?: string }).delta || '');
       if (delta) {
         this.emit('text', { content: delta, isNewResponse: false } as RealtimeTextEvent);
@@ -409,12 +433,18 @@ export class OpenAIRealtimeClient extends EventEmitter {
       if (transcript) {
         if (this.sessionMode === 'meeting') {
           this.appendMeetingSegment(transcript);
+        } else if (this.hasInstructions()) {
+          // Keep ASR as a fallback when prompt-guided response deviates.
+          this.singleAsrSegments.push(transcript);
         } else {
           this.emit('text', { content: transcript, isNewResponse: true } as RealtimeTextEvent);
         }
       }
 
       if (this.sessionMode === 'single') {
+        if (this.hasInstructions()) {
+          return;
+        }
         this.emitStatus('completed');
         void this.disconnect();
       }
@@ -428,8 +458,33 @@ export class OpenAIRealtimeClient extends EventEmitter {
       }
       const delta = String((data as { delta?: string }).delta || '');
       if (delta) {
-        this.currentResponseText += delta;
-        this.emit('text', { content: delta, isNewResponse: false } as RealtimeTextEvent);
+        if (this.markerSeen) {
+          this.emitResponseDelta(delta);
+          return;
+        }
+
+        this.responsePrefixBuffer.push(delta);
+
+        const joined = this.responsePrefixBuffer.join('');
+        const markerNoTrailingNl = BRAINWAVE_MARKER_PREFIX.replace(/\n+$/, '');
+
+        let markerIndex = joined.indexOf(BRAINWAVE_MARKER_PREFIX);
+        let markerLength = BRAINWAVE_MARKER_PREFIX.length;
+        if (markerIndex === -1) {
+          markerIndex = joined.indexOf(markerNoTrailingNl);
+          markerLength = markerNoTrailingNl.length;
+        }
+
+        if (markerIndex !== -1) {
+          this.markerSeen = true;
+          this.markerMatched = true;
+          const remaining = joined.slice(markerIndex + markerLength).replace(/^\n+/, '');
+          this.responsePrefixBuffer = [];
+          if (remaining) {
+            this.emitResponseDelta(remaining);
+          }
+          return;
+        }
       }
       return;
     }
@@ -468,8 +523,23 @@ export class OpenAIRealtimeClient extends EventEmitter {
   }
 
   private handleResponseDone(): void {
+    if (!this.markerMatched && this.responsePrefixBuffer.length > 0) {
+      const flushed = this.stripMarkerPrefix(this.responsePrefixBuffer.join(''));
+      this.responsePrefixBuffer = [];
+      this.markerSeen = true;
+      if (flushed) {
+        this.currentResponseText += flushed;
+      }
+    }
+
     const raw = (this.currentResponseText || '').trim();
-    this.currentResponseText = '';
+    const fallbackAsrText = this.singleAsrSegments.join('\n').trim();
+    const shouldUseAsrFallback =
+      this.sessionMode === 'single' &&
+      this.hasInstructions() &&
+      Boolean(fallbackAsrText) &&
+      (!this.markerMatched || this.looksConversational(raw));
+    this.resetSingleResponseState();
 
     const parsed = this.tryParseStructuredResult(raw);
     if (parsed) {
@@ -480,6 +550,9 @@ export class OpenAIRealtimeClient extends EventEmitter {
     if (parsed && Array.isArray((parsed as { speech_segments?: unknown }).speech_segments)) {
       const segments = (parsed as { speech_segments?: Array<{ content?: string }> }).speech_segments || [];
       finalText = segments.map((seg) => seg.content || '').filter(Boolean).join('\n');
+    }
+    if (shouldUseAsrFallback) {
+      finalText = fallbackAsrText;
     }
 
     if (finalText) {
@@ -548,6 +621,57 @@ export class OpenAIRealtimeClient extends EventEmitter {
 
   private isRecoverableMeetingDrop(): boolean {
     return this.sessionMode === 'meeting' && !this.closed && !this.wasManuallyDisconnected && !this.meetingStopRequested;
+  }
+
+  private emitResponseDelta(delta: string): void {
+    if (!delta) {
+      return;
+    }
+    this.currentResponseText += delta;
+    this.emit('text', { content: delta, isNewResponse: false } as RealtimeTextEvent);
+  }
+
+  private stripMarkerPrefix(text: string): string {
+    const source = String(text || '');
+    if (!source) {
+      return '';
+    }
+
+    const markerNoTrailingNl = BRAINWAVE_MARKER_PREFIX.replace(/\n+$/, '');
+    if (source.startsWith(BRAINWAVE_MARKER_PREFIX)) {
+      return source.slice(BRAINWAVE_MARKER_PREFIX.length);
+    }
+    if (source.startsWith(markerNoTrailingNl)) {
+      return source.slice(markerNoTrailingNl.length).replace(/^\n+/, '');
+    }
+
+    const markerIndex = source.indexOf(BRAINWAVE_MARKER_PREFIX);
+    if (markerIndex !== -1) {
+      return source.slice(markerIndex + BRAINWAVE_MARKER_PREFIX.length);
+    }
+
+    const markerNoNlIndex = source.indexOf(markerNoTrailingNl);
+    if (markerNoNlIndex !== -1) {
+      return source.slice(markerNoNlIndex + markerNoTrailingNl.length).replace(/^\n+/, '');
+    }
+
+    return source;
+  }
+
+  private resetSingleResponseState(): void {
+    this.currentResponseText = '';
+    this.responsePrefixBuffer = [];
+    this.markerSeen = false;
+    this.markerMatched = false;
+    this.singleAsrSegments = [];
+  }
+
+  private looksConversational(text: string): boolean {
+    const source = String(text || '').trim();
+    if (!source) {
+      return true;
+    }
+    return CONVERSATIONAL_RESPONSE_PATTERNS.some((pattern) => pattern.test(source));
   }
 
   private hasInstructions(): boolean {
