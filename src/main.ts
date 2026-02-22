@@ -10,9 +10,7 @@ import { MemoryManager } from './backend/memory-manager';
 import { OpenAITranscriber } from './backend/openai-transcriber';
 import { SynthesisProcessor } from './backend/synthesis-processor';
 import { ConsensusTranscriber } from './backend/consensus-transcriber';
-import { MeetingNotesGenerator, NotionMcpService } from './meeting';
 import { getSystemAudioService } from './system-audio-service';
-import { getPermissionService } from './permission-service';
 import { registerAllHandlers } from './ipc';
 
 // Handle EPIPE errors on stdout/stderr to prevent crashes when terminal is closed
@@ -58,84 +56,7 @@ let configManager: ConfigManager | null = null;
 let geminiTranscriber: GeminiTranscriber | null = null;
 let jobQueue: TranscriptionJobQueue | null = null;
 let openAIClient: OpenAIRealtimeClient | null = null;
-let meetingNotesGenerator: MeetingNotesGenerator | null = null;
 let memoryManager: MemoryManager | null = null;
-let notionMcpService: NotionMcpService | null = null;
-let realtimeMeetingMode = false;
-// Queue of system audio chunks for synchronized mixing with mic audio.
-// Using a queue instead of a single pointer prevents temporal misalignment:
-// - Single pointer causes duplication (same chunk mixed into multiple mic frames)
-// - Single pointer causes drops (intermediate chunks overwritten before mixing)
-const systemAudioQueue: Buffer[] = [];
-const MAX_SYSTEM_AUDIO_QUEUE_SIZE = 10; // ~400ms of audio at 24kHz with 960-sample chunks
-let systemAudioListenersBound = false;
-
-function bindSystemAudioEvents(): void {
-  if (systemAudioListenersBound) {
-    return;
-  }
-  const systemAudio = getSystemAudioService();
-  systemAudio.on('audio-data', (chunk: Buffer) => {
-    systemAudioQueue.push(chunk);
-    // Limit queue size to prevent unbounded memory growth if mic events lag
-    while (systemAudioQueue.length > MAX_SYSTEM_AUDIO_QUEUE_SIZE) {
-      systemAudioQueue.shift();
-    }
-  });
-  systemAudio.on('status', (status: string) => {
-    sendRealtimeEvent({ type: 'system_audio_status', status });
-  });
-  systemAudio.on('error', (err: Error) => {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn('[SystemAudio] Error, clearing audio queue:', message);
-    systemAudioQueue.length = 0;
-    sendRealtimeEvent({ type: 'system_audio_error', content: message });
-  });
-  systemAudio.on('recovery-scheduled', (info: { attempt: number; maxAttempts: number; delayMs: number }) => {
-    sendRealtimeEvent({ type: 'system_audio_recovering', ...info });
-  });
-  systemAudio.on('recovery-succeeded', () => {
-    sendRealtimeEvent({ type: 'system_audio_recovered' });
-  });
-  systemAudio.on('recovery-failed', () => {
-    sendRealtimeEvent({ type: 'system_audio_recovery_failed' });
-  });
-  systemAudioListenersBound = true;
-}
-
-async function startSystemAudioCapture(): Promise<boolean> {
-  bindSystemAudioEvents();
-
-  const permissionService = getPermissionService();
-  let permission = await permissionService.checkSystemAudioPermission();
-  if (permission !== 'granted' && permission !== 'unknown') {
-    const granted = await permissionService.requestSystemAudioPermission();
-    if (granted) {
-      permission = 'granted';
-    }
-  }
-
-  if (permission !== 'granted' && permission !== 'unknown') {
-    sendRealtimeEvent({ type: 'system_audio_permission', status: permission });
-    return false;
-  }
-
-  const systemAudio = getSystemAudioService();
-  const started = await systemAudio.start({ sampleRate: 24000 });
-  if (!started) {
-    sendRealtimeEvent({ type: 'system_audio_permission', status: 'unavailable' });
-  } else if (realtimeMeetingMode) {
-    systemAudio.enableRecovery();
-  }
-  return started;
-}
-
-async function stopSystemAudioCapture(): Promise<void> {
-  systemAudioQueue.length = 0;
-  const systemAudio = getSystemAudioService();
-  systemAudio.disableRecovery();
-  await systemAudio.stop();
-}
 
 function getRendererPath(): string {
   return path.join(__dirname, '..', 'assets', 'realtime.html');
@@ -146,31 +67,6 @@ function sendRealtimeEvent(payload: Record<string, unknown>): void {
     return;
   }
   mainWindow.webContents.send('openai-realtime-event', payload);
-}
-
-async function generateMeetingNotesInBackground(jobId: string, transcriptText: string): Promise<void> {
-  if (!meetingNotesGenerator || !jobQueue) {
-    return;
-  }
-
-  try {
-    const notes = await meetingNotesGenerator.generate(transcriptText);
-    const updated = jobQueue.updateMeetingNotes(jobId, notes);
-    sendRealtimeEvent({
-      type: 'meeting_notes_ready',
-      jobId,
-      meetingNotes: updated.meeting_notes,
-      updatedAt: updated.updated_at,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn(`Meeting notes generation failed for job ${jobId}:`, message);
-    sendRealtimeEvent({
-      type: 'meeting_notes_failed',
-      jobId,
-      content: message,
-    });
-  }
 }
 
 // Create the main window (hidden by default for menu bar app)
@@ -302,8 +198,6 @@ app.commandLine.appendSwitch('enable-speech-dispatcher');
 app.whenReady().then(async () => {
   configManager = new ConfigManager();
   geminiTranscriber = new GeminiTranscriber(configManager);
-  meetingNotesGenerator = new MeetingNotesGenerator(configManager);
-  notionMcpService = new NotionMcpService();
 
   // Initialize consensus transcription services
   memoryManager = new MemoryManager(configManager);
@@ -328,19 +222,11 @@ app.whenReady().then(async () => {
     configManager,
     geminiTranscriber,
     jobQueue,
-    meetingNotesGenerator,
-    notionMcpService,
     memoryManager,
     getMainWindow: () => mainWindow,
     getOpenAIClient: () => openAIClient,
     setOpenAIClient: (client) => { openAIClient = client; },
-    getRealtimeMeetingMode: () => realtimeMeetingMode,
-    setRealtimeMeetingMode: (mode) => { realtimeMeetingMode = mode; },
-    getSystemAudioQueue: () => systemAudioQueue,
-    startSystemAudioCapture,
-    stopSystemAudioCapture,
     sendRealtimeEvent,
-    generateMeetingNotesInBackground,
   });
 
   // macOS dock menu with Quit option
@@ -414,7 +300,7 @@ app.on('will-quit', (event) => {
     void openAIClient.disconnect();
     openAIClient = null;
   }
-  void stopSystemAudioCapture();
+  void getSystemAudioService().stop();
 
   // Force exit after cleanup — keyspy child process can keep the app alive
   // if SIGTERM doesn't kill the native binary fast enough.

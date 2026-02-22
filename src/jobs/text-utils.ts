@@ -49,3 +49,33 @@ export function buildSegments(text: string): TranscriptionResult['speech_segment
     speaker: 'Speaker 1',
   }));
 }
+
+export interface MarkdownExportInput {
+  title: string;
+  summary?: string;
+  transcript?: string;
+  createdAt?: string;
+}
+
+export function formatTranscriptionMarkdownExport(input: MarkdownExportInput): string {
+  const title = String(input.title || '').trim() || 'Untitled Transcription';
+  const summary = String(input.summary || '').trim();
+  const transcript = String(input.transcript || '').trim();
+  const createdAt = String(input.createdAt || '').trim();
+
+  const lines: string[] = [`# ${title}`, ''];
+
+  if (createdAt) {
+    lines.push(`_Recorded: ${createdAt}_`, '');
+  }
+
+  if (summary) {
+    lines.push('## Summary', '', summary, '');
+  }
+
+  if (transcript) {
+    lines.push('## Transcript', '', transcript, '');
+  }
+
+  return lines.join('\n').trim() + '\n';
+}

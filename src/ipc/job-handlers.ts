@@ -1,13 +1,12 @@
 import { ipcMain } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
-import { MeetingNotes } from '../backend/gemini-transcriber';
 import { IpcDependencies } from './types';
 import { getAudioMimeType } from './utils';
 
 export function registerJobHandlers(deps: IpcDependencies): void {
-  const shouldRunConsensusForOpenAILive = (provider: string, isMeetingMode: boolean, hasAudio: boolean): boolean => {
-    if (isMeetingMode || !hasAudio) {
+  const shouldRunConsensusForOpenAILive = (provider: string, hasAudio: boolean): boolean => {
+    if (!hasAudio) {
       return false;
     }
     const normalizedProvider = String(provider || '').trim().toLowerCase();
@@ -45,8 +44,6 @@ export function registerJobHandlers(deps: IpcDependencies): void {
         text?: string;
         title?: string;
         summary?: string;
-        meetingMode?: boolean;
-        meetingNotes?: MeetingNotes;
       },
     ) => {
       const jobId = String(payload?.jobId || '').trim();
@@ -63,10 +60,8 @@ export function registerJobHandlers(deps: IpcDependencies): void {
         throw new Error('Job not found');
       }
 
-      const isMeetingMode = Boolean(payload?.meetingMode);
       const shouldUseConsensus = shouldRunConsensusForOpenAILive(
         existing.provider || 'openai',
-        isMeetingMode,
         Boolean(existing.audio_path),
       );
       if (shouldUseConsensus) {
@@ -76,25 +71,12 @@ export function registerJobHandlers(deps: IpcDependencies): void {
         return { job: queued };
       }
 
-      const meetingNotes = payload?.meetingNotes;
-      const diarizationStatus = isMeetingMode && existing.audio_path ? 'pending' : undefined;
       const completed = deps.jobQueue.completeAudioOnlyJob(
         jobId,
         text,
         payload?.title,
-        payload?.summary || meetingNotes?.summary,
-        meetingNotes,
-        diarizationStatus,
-        isMeetingMode,
+        payload?.summary,
       );
-
-      if (isMeetingMode && diarizationStatus === 'pending') {
-        deps.jobQueue.enqueueDiarization(jobId);
-      }
-
-      if (isMeetingMode && !meetingNotes && deps.meetingNotesGenerator) {
-        void deps.generateMeetingNotesInBackground(jobId, text);
-      }
 
       return completed;
     },
@@ -111,8 +93,6 @@ export function registerJobHandlers(deps: IpcDependencies): void {
         provider?: string;
         audioBytes?: ArrayBuffer;
         duration?: string;
-        meetingMode?: boolean;
-        meetingNotes?: MeetingNotes;
       },
     ) => {
       const text = String(payload?.text || '').trim();
@@ -121,10 +101,8 @@ export function registerJobHandlers(deps: IpcDependencies): void {
       }
       const provider = payload?.provider || 'openai';
       const audioBuffer = payload?.audioBytes ? Buffer.from(new Uint8Array(payload.audioBytes)) : undefined;
-      const isMeetingMode = Boolean(payload?.meetingMode);
       const shouldUseConsensus = shouldRunConsensusForOpenAILive(
         provider,
-        isMeetingMode,
         Boolean(audioBuffer && audioBuffer.length > 0),
       );
       if (shouldUseConsensus && audioBuffer) {
@@ -135,28 +113,14 @@ export function registerJobHandlers(deps: IpcDependencies): void {
         return { job: queued };
       }
 
-      const meetingNotes = payload?.meetingNotes;
-      const diarizationStatus = isMeetingMode && audioBuffer && audioBuffer.length > 0 ? 'pending' : undefined;
-
       const created = deps.jobQueue.createTextJob(
         text,
         provider,
         payload?.title,
-        payload?.summary || meetingNotes?.summary,
+        payload?.summary,
         audioBuffer,
         payload?.duration,
-        meetingNotes,
-        diarizationStatus,
-        isMeetingMode,
       );
-
-      if (isMeetingMode && diarizationStatus === 'pending') {
-        deps.jobQueue.enqueueDiarization(created.job.id);
-      }
-
-      if (isMeetingMode && !meetingNotes && deps.meetingNotesGenerator) {
-        void deps.generateMeetingNotesInBackground(created.job.id, text);
-      }
 
       return created;
     },

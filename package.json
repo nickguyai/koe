@@ -1,6 +1,6 @@
 {
   "name": "koe",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "Voice transcription with global hotkey support",
   "main": "dist/main.js",
   "scripts": {

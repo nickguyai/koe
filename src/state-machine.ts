@@ -5,15 +5,12 @@ export type RecordingState =
   | 'recording'
   | 'processing'
   | 'inserting'
-  | 'meeting_recording'
-  | 'meeting_processing'
   | 'error';
 
 export type StateTrigger = 
   | 'hotkey_press' 
   | 'hotkey_release' 
   | 'transcription_complete' 
-  | 'notes_complete'
   | 'insertion_complete' 
   | 'error'
   | 'reset';
@@ -40,14 +37,6 @@ const VALID_TRANSITIONS: Record<RecordingState, Partial<Record<StateTrigger, Rec
     insertion_complete: 'idle',
     error: 'idle',
   },
-  meeting_recording: {
-    hotkey_press: 'meeting_processing',
-    error: 'idle',
-  },
-  meeting_processing: {
-    notes_complete: 'idle',
-    error: 'idle',
-  },
   error: {
     reset: 'idle',
   },
@@ -62,7 +51,6 @@ export class RecordingStateMachine extends EventEmitter {
   private _currentState: RecordingState = 'idle';
   private _recordingStartTime: number | null = null;
   private _minRecordingDuration: number;
-  private _meetingModeEnabled: boolean = false;
 
   constructor(minRecordingDuration: number = 200) {
     super();
@@ -75,14 +63,6 @@ export class RecordingStateMachine extends EventEmitter {
 
   get recordingStartTime(): number | null {
     return this._recordingStartTime;
-  }
-
-  get meetingModeEnabled(): boolean {
-    return this._meetingModeEnabled;
-  }
-
-  setMeetingMode(enabled: boolean): void {
-    this._meetingModeEnabled = Boolean(enabled);
   }
 
   getRecordingDuration(): number {
@@ -103,7 +83,7 @@ export class RecordingStateMachine extends EventEmitter {
     }
 
     // Start duration tracking when entering a recording state.
-    if (nextState === 'recording' || nextState === 'meeting_recording') {
+    if (nextState === 'recording') {
       this._recordingStartTime = Date.now();
     }
 
@@ -155,7 +135,7 @@ export class RecordingStateMachine extends EventEmitter {
 
   private getNextState(trigger: StateTrigger): RecordingState | undefined {
     if (this._currentState === 'idle' && trigger === 'hotkey_press') {
-      return this._meetingModeEnabled ? 'meeting_recording' : 'recording';
+      return 'recording';
     }
 
     const validTransitions = VALID_TRANSITIONS[this._currentState];

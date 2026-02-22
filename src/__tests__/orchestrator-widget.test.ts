@@ -285,60 +285,6 @@ describe('Orchestrator transcription-error widget feedback', () => {
   });
 });
 
-describe('Orchestrator meeting detection monitor gating', () => {
-  let orchestrator: Orchestrator;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    Object.keys(ipcHandlers).forEach((k) => delete ipcHandlers[k]);
-    mockStateMachine.currentState = 'idle';
-    mockSystemAudioService.currentStatus = 'idle';
-    mockPermissionService.checkAll.mockResolvedValue({
-      microphone: 'granted',
-      systemAudio: 'granted',
-      accessibility: 'granted',
-    });
-    mockPermissionService.checkSystemAudioPermission.mockResolvedValue('granted');
-    mockConfigService.getMeetingDetectionEnabled.mockReturnValue(false);
-    orchestrator = new Orchestrator();
-  });
-
-  it('does not start background meeting detection before user opts in', async () => {
-    await orchestrator.start();
-    expect(mockSystemAudioService.start).not.toHaveBeenCalled();
-  });
-
-  it('starts meeting detection after opt-in when system audio permission is granted', async () => {
-    mockConfigService.getMeetingDetectionEnabled.mockReturnValue(true);
-
-    await orchestrator.start();
-
-    expect(mockSystemAudioService.start).toHaveBeenCalledWith(
-      expect.objectContaining({
-        includeProcessNames: expect.arrayContaining(['zoom.us', 'Google Meet']),
-      }),
-    );
-  });
-
-  it('skips meeting detection if system audio permission is not granted', async () => {
-    mockConfigService.getMeetingDetectionEnabled.mockReturnValue(true);
-    mockPermissionService.checkSystemAudioPermission.mockResolvedValue('unknown');
-
-    await orchestrator.start();
-
-    expect(mockSystemAudioService.start).not.toHaveBeenCalled();
-  });
-
-  it('persists meeting detection opt-in when meeting mode is enabled', async () => {
-    const handler = ipcHandlers['set-meeting-mode'];
-    expect(handler).toBeDefined();
-
-    await handler({}, true);
-
-    expect(mockConfigService.setMeetingDetectionEnabled).toHaveBeenCalledWith(true);
-  });
-});
-
 describe('Orchestrator desktop switching guard', () => {
   let orchestrator: Orchestrator;
 

@@ -3,10 +3,9 @@ import * as path from 'path';
 import { ConfigManager } from '../backend/config-manager';
 import { GeminiTranscriber } from '../backend/gemini-transcriber';
 import { ConsensusTranscriber } from '../backend/consensus-transcriber';
-import { formatMeetingMarkdownExport } from '../meeting';
 import { JobStore } from './job-store';
 import { JobRecord, TranscriptionResult, MeetingNotes, DiarizationStatus, SpeechSegment } from './types';
-import { cleanText, buildTitle, buildSummary, buildSegments } from './text-utils';
+import { cleanText, buildTitle, buildSummary, buildSegments, formatTranscriptionMarkdownExport } from './text-utils';
 
 export class TranscriptionJobQueue {
   private queue: string[] = [];
@@ -306,11 +305,10 @@ export class TranscriptionJobQueue {
       transcript = result.speech_segments.map((seg) => seg.content).join('\n\n');
     }
 
-    const markdown = formatMeetingMarkdownExport({
+    const markdown = formatTranscriptionMarkdownExport({
       title,
       summary,
       transcript,
-      meetingNotes: result?.meeting_notes || null,
       createdAt: record.created_at,
     });
 

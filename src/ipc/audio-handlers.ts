@@ -3,13 +3,28 @@ import { getSystemAudioService } from '../system-audio-service';
 import { getPermissionService } from '../permission-service';
 import { IpcDependencies } from './types';
 
-export function registerAudioHandlers(deps: IpcDependencies): void {
+export function registerAudioHandlers(_deps: IpcDependencies): void {
   ipcMain.handle('system-audio-start', async () => {
-    return deps.startSystemAudioCapture();
+    const permissionService = getPermissionService();
+    let permission = await permissionService.checkSystemAudioPermission();
+    if (permission !== 'granted' && permission !== 'unknown') {
+      const granted = await permissionService.requestSystemAudioPermission();
+      if (granted) {
+        permission = 'granted';
+      }
+    }
+
+    if (permission !== 'granted' && permission !== 'unknown') {
+      return false;
+    }
+
+    const service = getSystemAudioService();
+    return service.start({ sampleRate: 24000 });
   });
 
   ipcMain.handle('system-audio-stop', async () => {
-    await deps.stopSystemAudioCapture();
+    const service = getSystemAudioService();
+    await service.stop();
     return true;
   });
 

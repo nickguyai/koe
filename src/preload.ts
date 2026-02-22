@@ -1,31 +1,4 @@
-import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron';
-
-type MeetingEventChannel = 'meeting-mode-suggestion' | 'meeting-mode-updated';
-type MeetingEventHandler = (_event: IpcRendererEvent, payload: any) => void;
-
-const meetingEventHandlers: Partial<Record<MeetingEventChannel, MeetingEventHandler>> = {};
-
-function registerSingleMeetingEventHandler(
-  channel: MeetingEventChannel,
-  callback: (payload: any) => void,
-): () => void {
-  const existingHandler = meetingEventHandlers[channel];
-  if (existingHandler) {
-    ipcRenderer.removeListener(channel, existingHandler);
-  }
-
-  const handler: MeetingEventHandler = (_event, payload) => callback(payload);
-  meetingEventHandlers[channel] = handler;
-  ipcRenderer.on(channel, handler);
-
-  return () => {
-    const currentHandler = meetingEventHandlers[channel];
-    if (currentHandler === handler) {
-      delete meetingEventHandlers[channel];
-    }
-    ipcRenderer.removeListener(channel, handler);
-  };
-}
+import { contextBridge, ipcRenderer } from 'electron';
 
 // Expose protected methods that allow the renderer process to use
 // ipcRenderer without exposing the entire object
@@ -65,24 +38,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   updateHotkey: (accelerator: string) => {
     return ipcRenderer.invoke('update-hotkey', accelerator);
-  },
-  setMeetingMode: (enabled: boolean) => {
-    return ipcRenderer.invoke('set-meeting-mode', enabled);
-  },
-  getMeetingMode: () => {
-    return ipcRenderer.invoke('get-meeting-mode');
-  },
-  dismissMeetingModeSuggestion: (payload: { appName?: string; dontAskAgain?: boolean }) => {
-    return ipcRenderer.invoke('meeting-mode-suggestion-dismiss', payload || {});
-  },
-  switchMeetingModeSuggestion: (payload: { appName?: string; dontAskAgain?: boolean }) => {
-    return ipcRenderer.invoke('meeting-mode-suggestion-switch', payload || {});
-  },
-  onMeetingModeSuggestion: (callback: (payload: any) => void) => {
-    return registerSingleMeetingEventHandler('meeting-mode-suggestion', callback);
-  },
-  onMeetingModeUpdated: (callback: (payload: any) => void) => {
-    return registerSingleMeetingEventHandler('meeting-mode-updated', callback);
   },
 
   // Open URL in default browser
@@ -133,14 +88,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   exportTranscriptionJob: (jobId: string) => {
     return ipcRenderer.invoke('transcription-job-export', jobId);
   },
-  shareMeetingToNotion: (payload: { jobId: string }) => {
-    return ipcRenderer.invoke('transcription-job-share-notion', payload);
-  },
   updateActionItems: (payload: { jobId: string; completedItems: number[] }) => {
     return ipcRenderer.invoke('transcription-job-update-action-items', payload);
-  },
-  generateMeetingNotes: (jobId: string) => {
-    return ipcRenderer.invoke('generate-meeting-notes', jobId);
   },
 
   // OpenAI realtime
@@ -189,12 +138,6 @@ declare global {
       getRecordingState: () => Promise<{ state: string; isRecording: boolean; duration: number }>;
       getHotkey: () => Promise<{ accelerator: string; enabled: boolean }>;
       updateHotkey: (accelerator: string) => Promise<boolean>;
-      setMeetingMode: (enabled: boolean) => Promise<boolean>;
-      getMeetingMode: () => Promise<boolean>;
-      dismissMeetingModeSuggestion: (payload: { appName?: string; dontAskAgain?: boolean }) => Promise<boolean>;
-      switchMeetingModeSuggestion: (payload: { appName?: string; dontAskAgain?: boolean }) => Promise<boolean>;
-      onMeetingModeSuggestion: (callback: (payload: any) => void) => () => void;
-      onMeetingModeUpdated: (callback: (payload: any) => void) => () => void;
       openExternal: (url: string) => Promise<boolean>;
       getSettings: () => Promise<Record<string, unknown>>;
       setSettings: (settings: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -210,9 +153,7 @@ declare global {
       polishTranscriptionJob: (payload: { jobId: string; style?: string; customPrompt?: string }) => Promise<any>;
       deleteTranscriptionJob: (jobId: string) => Promise<{ deleted: boolean }>;
       exportTranscriptionJob: (jobId: string) => Promise<{ title: string; markdown: string; filename: string }>;
-      shareMeetingToNotion: (payload: { jobId: string }) => Promise<{ ok: boolean; toolName?: string; pageId?: string; pageUrl?: string; message?: string }>;
       updateActionItems: (payload: { jobId: string; completedItems: number[] }) => Promise<{ completedItems: number[]; updated_at: string }>;
-      generateMeetingNotes: (jobId: string) => Promise<{ meeting_notes: Record<string, unknown>; updated_at: string } | null>;
       openAIRealtimeStart: (options?: { meetingMode?: boolean }) => Promise<boolean>;
       openAIRealtimeStop: (options?: { meetingMode?: boolean }) => Promise<boolean | { transcript?: string }>;
       openAIRealtimeDisconnect: () => Promise<boolean>;

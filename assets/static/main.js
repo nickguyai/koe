@@ -61,13 +61,8 @@ let liveMediaRecorderChunks = [];
 let liveEarlyJobId = null;
 let liveRecordingStartTime = null;
 let liveRecordingEndTime = null;
-let liveMeetingModeActive = false;
-let liveMeetingSegments = [];
-let liveMeetingDisplaySegments = [];
-let liveMeetingTranscript = '';
 let liveTranscriptPinned = true;
 let liveTranscriptCollapsed = false;
-let pendingMeetingSuggestionApp = '';
 const activeDiarizationPollers = new Set();
 
 // App settings
@@ -84,8 +79,6 @@ let settings = {
     geminiModel: 'gemini-3-flash-preview',
     consensusEnabled: false,
     consensusMemoryEnabled: true,
-    meetingCaptureEnabled: false,
-    meetingNotesModel: 'gpt-5.2-2025-12-11',
     speakerLabels: {},
     hotkey: {
         code: 'Space',
@@ -340,7 +333,6 @@ const saveSettingsBtn = document.getElementById('saveSettings');
 const openaiKey = document.getElementById('openaiKey');
 const geminiKey = document.getElementById('geminiKey');
 const geminiModelSelect = document.getElementById('geminiModelSelect');
-const meetingNotesModelSelect = document.getElementById('meetingNotesModelSelect');
 const languageSelect = document.getElementById('languageSelect');
 const summaryOptions = document.querySelectorAll('.summary-option');
 const settingToggles = document.querySelectorAll('.setting-toggle');
@@ -361,14 +353,6 @@ const featuredCopyBtn = document.getElementById('featuredCopyBtn');
 
 // Mode Selector
 const modeOptions = document.querySelectorAll('.mode-option');
-
-// Meeting detection prompt
-const meetingDetectPrompt = document.getElementById('meetingDetectPrompt');
-const meetingDetectPromptMessage = document.getElementById('meetingDetectPromptMessage');
-const meetingDetectDontAskAgain = document.getElementById('meetingDetectDontAskAgain');
-const meetingDetectNotNowBtn = document.getElementById('meetingDetectNotNowBtn');
-const meetingDetectSwitchBtn = document.getElementById('meetingDetectSwitchBtn');
-const meetingDetectClose = document.getElementById('meetingDetectClose');
 
 // Live transcript panel
 const liveTranscriptPanel = document.getElementById('liveTranscriptPanel');
@@ -448,15 +432,6 @@ function isElectronEnvironment() {
     return typeof window.electronAPI !== 'undefined' || navigator.userAgent.includes('Electron');
 }
 
-async function syncMeetingModeToMainProcess() {
-    if (!window.electronAPI || !window.electronAPI.setMeetingMode) return;
-    try {
-        await window.electronAPI.setMeetingMode(!!settings.meetingCaptureEnabled);
-    } catch (e) {
-        console.warn('Failed to sync meeting mode to main process:', e);
-    }
-}
-
 function normalizeSpeakerKey(value) {
     return String(value || '')
         .trim()
@@ -475,46 +450,22 @@ function resolveSpeakerLabel(rawSpeakerName, fallbackName = 'Speaker') {
 
 function applyModeSelection(mode, options = {}) {
     const persist = options.persist !== false;
-    const syncMainProcess = options.syncMainProcess !== false;
-    const normalizedMode = mode === 'meeting' ? 'meeting' : (mode === 'openai' ? 'openai' : 'gemini');
-    const isMeeting = normalizedMode === 'meeting';
+    const normalizedMode = mode === 'openai' ? 'openai' : 'gemini';
 
     modeOptions.forEach(option => {
         option.classList.toggle('active', option.dataset.mode === normalizedMode);
     });
 
-    currentProvider = (normalizedMode === 'openai' || isMeeting) ? 'openai' : 'gemini';
+    currentProvider = normalizedMode === 'openai' ? 'openai' : 'gemini';
     settings.defaultMode = normalizedMode;
-    settings.meetingCaptureEnabled = isMeeting;
-
-    const settingsToggle = document.querySelector('[data-setting="meetingCaptureEnabled"] .toggle-switch');
-    if (settingsToggle) {
-        settingsToggle.classList.toggle('active', isMeeting);
-    }
-
-    const meetingBanner = document.getElementById('meetingBanner');
-    if (meetingBanner) {
-        meetingBanner.style.display = isMeeting ? 'block' : 'none';
-    }
-
-    document.body.classList.toggle('meeting-mode', isMeeting);
     updateRecordingUI(isRecording);
-
-    if (!isMeeting) {
-        hideMeetingModeSuggestionPrompt();
-    }
 
     if (persist) {
         api.setSettings({
-            meetingCaptureEnabled: isMeeting,
             defaultMode: normalizedMode
         }).catch((e) => {
             console.warn('Failed to persist mode selection:', e);
         });
-    }
-
-    if (syncMainProcess) {
-        syncMeetingModeToMainProcess();
     }
 }
 
@@ -577,103 +528,6 @@ function setupLiveTranscriptPanelListeners() {
             if (liveTranscriptPinned && liveTranscriptPanelBody) {
                 liveTranscriptPanelBody.scrollTop = liveTranscriptPanelBody.scrollHeight;
             }
-        });
-    }
-}
-
-function hideMeetingModeSuggestionPrompt() {
-    if (!meetingDetectPrompt) return;
-    meetingDetectPrompt.style.display = 'none';
-    pendingMeetingSuggestionApp = '';
-    if (meetingDetectDontAskAgain) {
-        meetingDetectDontAskAgain.checked = false;
-    }
-}
-
-function hasMeetingSuggestionBridge() {
-    return !!(window.electronAPI
-        && typeof window.electronAPI.dismissMeetingModeSuggestion === 'function'
-        && typeof window.electronAPI.switchMeetingModeSuggestion === 'function');
-}
-
-function showMeetingModeSuggestionPrompt(payload = {}) {
-    if (!hasMeetingSuggestionBridge()) {
-        console.warn('Meeting detection prompt is only available in the Electron app');
-        return;
-    }
-    if (!meetingDetectPrompt) return;
-    const appName = String(payload.appName || payload.processName || 'this app').trim();
-    pendingMeetingSuggestionApp = appName;
-    if (meetingDetectPromptMessage) {
-        meetingDetectPromptMessage.textContent = `Looks like a meeting is starting in ${appName}. Switch to Meeting Capture?`;
-    }
-    if (meetingDetectDontAskAgain) {
-        meetingDetectDontAskAgain.checked = false;
-    }
-    meetingDetectPrompt.style.display = 'block';
-}
-
-async function dismissMeetingModeSuggestionPrompt() {
-    const dontAskAgain = !!meetingDetectDontAskAgain?.checked;
-    if (!window.electronAPI || !window.electronAPI.dismissMeetingModeSuggestion) {
-        if (dontAskAgain) {
-            showToast('"Don\'t ask again" is only available in the desktop app');
-        }
-        hideMeetingModeSuggestionPrompt();
-        return;
-    }
-    try {
-        await window.electronAPI.dismissMeetingModeSuggestion({
-            appName: pendingMeetingSuggestionApp,
-            dontAskAgain
-        });
-    } catch (e) {
-        console.warn('Failed to dismiss meeting suggestion:', e);
-    } finally {
-        hideMeetingModeSuggestionPrompt();
-    }
-}
-
-async function switchMeetingModeFromSuggestion() {
-    const dontAskAgain = !!meetingDetectDontAskAgain?.checked;
-    const hasBridge = !!(window.electronAPI && window.electronAPI.switchMeetingModeSuggestion);
-    try {
-        if (hasBridge) {
-            await window.electronAPI.switchMeetingModeSuggestion({
-                appName: pendingMeetingSuggestionApp,
-                dontAskAgain
-            });
-        } else {
-            console.warn('Meeting mode suggestion bridge unavailable, applying local mode switch only');
-        }
-        applyModeSelection('meeting', { persist: true, syncMainProcess: false });
-        if (!hasBridge && dontAskAgain) {
-            showToast('Meeting mode enabled (desktop app required to save "Don\'t ask again")');
-        } else {
-            showToast('Meeting mode enabled');
-        }
-    } catch (e) {
-        console.warn('Failed to switch from meeting suggestion:', e);
-        showToast('Unable to switch meeting mode');
-    } finally {
-        hideMeetingModeSuggestionPrompt();
-    }
-}
-
-function setupMeetingDetectionPromptListeners() {
-    if (meetingDetectNotNowBtn) {
-        meetingDetectNotNowBtn.addEventListener('click', () => {
-            dismissMeetingModeSuggestionPrompt();
-        });
-    }
-    if (meetingDetectClose) {
-        meetingDetectClose.addEventListener('click', () => {
-            dismissMeetingModeSuggestionPrompt();
-        });
-    }
-    if (meetingDetectSwitchBtn) {
-        meetingDetectSwitchBtn.addEventListener('click', () => {
-            switchMeetingModeFromSuggestion();
         });
     }
 }
@@ -976,7 +830,7 @@ function setupModeSelector() {
         option.addEventListener('click', () => {
             const mode = option.dataset.mode;
             if (!mode) return;
-            applyModeSelection(mode, { persist: true, syncMainProcess: true });
+            applyModeSelection(mode, { persist: true });
         });
     });
 }
@@ -1689,8 +1543,6 @@ function stopTimer() {
 }
 
 function updateRecordingUI(recording) {
-    const isMeeting = !!settings.meetingCaptureEnabled;
-
     if (recordButton) {
         recordButton.classList.toggle('recording', recording);
     }
@@ -1699,35 +1551,25 @@ function updateRecordingUI(recording) {
 
     if (timer) timer.classList.toggle('active', recording);
     if (recordingLabel) {
-        const idleLabel = isMeeting ? 'Start Meeting Capture' : 'Begin Recording';
-        recordingLabel.textContent = recording ? (isMeeting ? 'Capturing Meeting' : '') : idleLabel;
-        recordingLabel.style.display = recording && !isMeeting ? 'none' : 'block';
+        recordingLabel.textContent = recording ? '' : 'Begin Recording';
+        recordingLabel.style.display = recording ? 'none' : 'block';
     }
     if (recordingHint) {
         if (recording) {
-            recordingHint.textContent = isMeeting ? 'System audio + mic recording' : 'Recording in progress';
+            recordingHint.textContent = 'Recording in progress';
         } else {
-            recordingHint.textContent = isMeeting
-                ? 'Hotkey toggles start and stop for continuous meeting capture'
-                : 'Tap to capture and transcribe';
+            recordingHint.textContent = 'Tap to capture and transcribe';
         }
     }
 
     document.body.classList.toggle('is-recording', recording);
-    document.body.classList.toggle('meeting-mode', isMeeting);
 }
 
 async function startRecording() {
     if (isRecording) return;
 
-    // Clear any lingering meeting summary from previous session
-    dismissMeetingCaptureSummary();
-    hideMeetingModeSuggestionPrompt();
-
     try {
-        const isMeetingMode = !!settings.meetingCaptureEnabled;
-
-        if (currentProvider === 'gemini' && !isMeetingMode) {
+        if (currentProvider === 'gemini') {
             const geminiValue = (geminiKey?.value || '').trim();
             if (!geminiValue) {
                 showToast('Gemini API key is required');
@@ -1774,18 +1616,9 @@ async function startRecording() {
 
         isRecording = true;
         updateRecordingUI(true);
-        liveMeetingModeActive = isMeetingMode;
-        liveMeetingSegments = [];
-        liveMeetingDisplaySegments = [];
-        liveMeetingTranscript = '';
-        if (isMeetingMode) {
-            liveTranscriptCollapsed = false;
-            resetLiveTranscriptPanel({ hide: false });
-        } else {
-            resetLiveTranscriptPanel({ hide: true });
-        }
+        resetLiveTranscriptPanel({ hide: true });
 
-        if (currentProvider === 'gemini' && !isMeetingMode) {
+        if (currentProvider === 'gemini') {
             console.log('Starting MediaRecorder for Gemini mode');
             mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
             mediaRecorder.ondataavailable = (e) => {
@@ -1811,7 +1644,7 @@ async function startRecording() {
                 console.warn('Could not start live MediaRecorder:', err);
                 liveMediaRecorder = null;
             }
-            await initLiveSession({ meetingMode: isMeetingMode });
+            await initLiveSession();
         }
 
         startTimer();
@@ -1927,17 +1760,8 @@ async function stopRecording() {
         // Brief pause to let in-flight IPC audio chunks arrive at the backend
         await new Promise((resolve) => setTimeout(resolve, 350));
 
-        let stopResult = null;
         if (window.electronAPI && window.electronAPI.openAIRealtimeStop) {
-            stopResult = await window.electronAPI.openAIRealtimeStop({ meetingMode: liveMeetingModeActive });
-        }
-
-        if (liveMeetingModeActive) {
-            const transcriptFromStop = stopResult && typeof stopResult === 'object'
-                ? (stopResult.transcript || '')
-                : '';
-            const transcript = transcriptFromStop || liveMeetingTranscript || liveMeetingSegments.join('\n').trim();
-            await finalizeMeetingCapture(transcript);
+            await window.electronAPI.openAIRealtimeStop();
         }
     }
 }
@@ -1960,10 +1784,6 @@ function resetRecordingState() {
         mediaRecorderChunks = [];
     }
 
-    liveMeetingModeActive = false;
-    liveMeetingSegments = [];
-    liveMeetingDisplaySegments = [];
-    liveMeetingTranscript = '';
     resetLiveTranscriptPanel({ hide: true });
     cleanupLiveAudio();
 }
@@ -1981,18 +1801,17 @@ function ensureOpenAIListener() {
     openAIListenerAttached = true;
 }
 
-async function initLiveSession(options = {}) {
+async function initLiveSession() {
     if (!window.electronAPI || !window.electronAPI.openAIRealtimeStart) {
         throw new Error('Live mode requires the Electron backend');
     }
 
     liveSessionStarting = true;
     liveSavedForSession = false;
-    liveMeetingModeActive = !!options.meetingMode;
     ensureOpenAIListener();
 
     try {
-        const startSessionPromise = window.electronAPI.openAIRealtimeStart({ meetingMode: liveMeetingModeActive });
+        const startSessionPromise = window.electronAPI.openAIRealtimeStart();
         const startAudioPromise = startAudioStreaming();
         await Promise.all([startSessionPromise, startAudioPromise]);
         liveSessionActive = true;
@@ -2064,15 +1883,7 @@ async function startAudioStreaming() {
 function handleLiveMessage(data) {
     console.log('Live message received:', data.type, 'isRecording:', isRecording, 'liveSessionStarting:', liveSessionStarting);
 
-    if (data.type === 'segment') {
-        if (liveMeetingModeActive) {
-            appendMeetingSegment(data.segment);
-        }
-    } else if (data.type === 'text') {
-        if (liveMeetingModeActive) {
-            // Meeting mode uses only segment events.
-            return;
-        }
+    if (data.type === 'text') {
         if (data.isNewResponse) {
             displayLiveTranscription(data.content);
         } else {
@@ -2085,36 +1896,8 @@ function handleLiveMessage(data) {
             console.log('Ignoring status during active session');
             return;
         }
-        if (liveMeetingModeActive) {
-            return;
-        }
         if (data.status === 'completed') {
             cleanupLiveAudio();
-        }
-    } else if (data.type === 'system_audio_permission') {
-        if (data.status && data.status !== 'granted') {
-            showToast('System audio unavailable, continuing with microphone only');
-        }
-    } else if (data.type === 'system_audio_error') {
-        showToast(data.content || 'System audio capture error');
-    } else if (data.type === 'system_audio_recovering') {
-        showSystemAudioWarning('System audio interrupted \u2014 recovering (attempt ' + data.attempt + '/' + data.maxAttempts + ')...');
-    } else if (data.type === 'system_audio_recovered') {
-        showToast('System audio recovered');
-        hideSystemAudioWarning();
-    } else if (data.type === 'system_audio_recovery_failed') {
-        showSystemAudioWarning('System audio lost \u2014 continuing with microphone only');
-    } else if (data.type === 'system_audio_status') {
-        if (data.status === 'recording') {
-            hideSystemAudioWarning();
-        }
-    } else if (data.type === 'meeting_notes_ready') {
-        const jobId = data.jobId;
-        if (!jobId) return;
-        refreshJobFromBackend(jobId, true);
-    } else if (data.type === 'meeting_notes_failed') {
-        if (data.content) {
-            console.warn('Meeting notes generation failed:', data.content);
         }
     } else if (data.type === 'error') {
         console.error('Server error:', data.content);
@@ -2190,16 +1973,12 @@ async function refreshJobFromBackend(jobId, showNotesToast = false) {
 }
 
 function displayLiveTranscription(text, options = {}) {
-    const {
-        autoComplete = true,
-        persist = true,
-        meetingMode = false
-    } = options;
+    const { autoComplete = true, persist = true } = options;
 
     // Update featured transcription block with the result
     if (featuredTranscription && featuredContent) {
         featuredTranscription.style.display = 'block';
-        if (featuredTitle) featuredTitle.textContent = meetingMode ? 'Meeting Transcript' : 'Live Transcription';
+        if (featuredTitle) featuredTitle.textContent = 'Live Transcription';
         if (featuredDate) featuredDate.textContent = new Date().toLocaleDateString();
         featuredContent.textContent = text;
 
@@ -2209,126 +1988,24 @@ function displayLiveTranscription(text, options = {}) {
             indicator.innerHTML = '<span class="polish-dot">◇</span><span class="polish-text">Raw transcript</span>';
         }
     }
-    showToast(meetingMode ? 'Meeting transcript complete' : 'Transcription complete');
+    showToast('Transcription complete');
 
     if (autoComplete && window.electronAPI && text && text.trim()) {
         window.electronAPI.sendTranscriptionComplete(text);
     }
     if (persist && text && text.trim()) {
-        persistLiveTranscription(text, { meetingMode });
+        persistLiveTranscription(text);
     }
 }
-
-function appendMeetingSegment(segment) {
-    const clean = String(segment || '').trim();
-    if (!clean) return;
-
-    const now = new Date();
-    const stamp = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    liveMeetingSegments.push(clean);
-    liveMeetingDisplaySegments.push(`[${stamp}] ${clean}`);
-    liveMeetingTranscript = liveMeetingSegments.join('\n');
-    appendLiveTranscriptRow(stamp, clean);
-
-    if (featuredTranscription && featuredContent) {
-        featuredTranscription.style.display = 'block';
-        if (featuredTitle) featuredTitle.textContent = 'Live Meeting Transcript';
-        if (featuredDate) featuredDate.textContent = new Date().toLocaleDateString();
-        featuredContent.textContent = liveMeetingDisplaySegments.join('\n');
-    }
-}
-
-function displayMeetingCaptureSummary(text) {
-    const preview = text.length > 300 ? text.slice(0, 300) + '...' : text;
-
-    // Remove any previous summary
-    const existing = document.getElementById('meetingSummary');
-    if (existing) existing.remove();
-
-    const summaryDiv = document.createElement('div');
-    summaryDiv.className = 'meeting-summary';
-    summaryDiv.id = 'meetingSummary';
-    summaryDiv.innerHTML = `
-        <h2 class="meeting-summary-title font-display">Meeting Capture Complete</h2>
-        <div class="meeting-summary-badges">
-            <span class="summary-badge">
-                <svg class="spinner-small" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>
-                Meeting notes
-            </span>
-            <span class="summary-badge">
-                <svg class="spinner-small" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>
-                Diarization
-            </span>
-        </div>
-        <div class="meeting-summary-preview">${escapeHtml(preview)}</div>
-        <button class="meeting-summary-cta" onclick="switchView('library')">
-            View full result in Library
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
-        </button>
-    `;
-
-    // Insert after the featured-transcription-wrapper, preserving cached DOM refs
-    const featuredWrapper = document.querySelector('.featured-transcription-wrapper');
-    if (featuredWrapper) {
-        // Hide the original featured block while summary is visible
-        if (featuredTranscription) featuredTranscription.style.display = 'none';
-        featuredWrapper.after(summaryDiv);
-    }
-}
-
-function dismissMeetingCaptureSummary() {
-    const summary = document.getElementById('meetingSummary');
-    if (summary) summary.remove();
-}
-
-async function finalizeMeetingCapture(transcript) {
-    const text = String(transcript || '').trim();
-
-    if (!text) {
-        if (liveEarlyJobId) {
-            // Audio was saved — show it so user can retry transcription
-            showToast('No transcript detected. Recording saved for retry.');
-            refreshJobFromBackend(liveEarlyJobId);
-            cleanupLiveAudio();
-            if (window.electronAPI) {
-                window.electronAPI.sendTranscriptionComplete('');
-            }
-        } else {
-            cleanupLiveAudio();
-            showToast('No meeting transcript captured');
-            if (window.electronAPI) {
-                window.electronAPI.sendTranscriptionError('No meeting transcript captured');
-            }
-        }
-        liveMeetingModeActive = false;
-        return;
-    }
-
-    displayMeetingCaptureSummary(text);
-    await persistLiveTranscription(text, { meetingMode: true });
-    cleanupLiveAudio();
-
-    if (window.electronAPI) {
-        window.electronAPI.sendTranscriptionComplete(text);
-    }
-
-    liveMeetingModeActive = false;
-    liveMeetingDisplaySegments = [];
-}
-
-async function persistLiveTranscription(text, options = {}) {
+async function persistLiveTranscription(text) {
     if (!text || !text.trim()) return;
     if (liveSavedForSession) return;
     liveSavedForSession = true;
-    const isMeetingMode = !!options.meetingMode;
 
     try {
         let saved = null;
         if (liveEarlyJobId) {
             const payload = { jobId: liveEarlyJobId, text };
-            if (isMeetingMode) {
-                payload.meetingMode = true;
-            }
             saved = await api.completeLiveAudioJob(payload);
             liveEarlyJobId = null;
         } else {
@@ -2343,9 +2020,6 @@ async function persistLiveTranscription(text, options = {}) {
                 const endTime = liveRecordingEndTime || Date.now();
                 const elapsed = Math.round((endTime - liveRecordingStartTime) / 1000);
                 payload.duration = formatDuration(elapsed);
-            }
-            if (isMeetingMode) {
-                payload.meetingMode = true;
             }
             saved = await api.saveLiveTranscription(payload);
         }
@@ -2405,10 +2079,6 @@ function appendLiveTranscription(delta) {
 function cleanupLiveAudio() {
     liveSessionStarting = false;
     liveSessionActive = false;
-    liveMeetingModeActive = false;
-    liveMeetingSegments = [];
-    liveMeetingDisplaySegments = [];
-    liveMeetingTranscript = '';
     hideSystemAudioWarning();
     // Stop parallel MediaRecorder if still active
     if (liveMediaRecorder && liveMediaRecorder.state !== 'inactive') {
@@ -3018,10 +2688,7 @@ let currentLibraryFilter = 'all';
 function renderLibrary() {
     if (!libraryList) return;
 
-    const filtered = currentLibraryFilter === 'all' ? transcriptions
-        : currentLibraryFilter === 'meetings'
-            ? transcriptions.filter(t => !!t.isMeeting || !!t.meetingNotes)
-            : transcriptions.filter(t => !t.isMeeting && !t.meetingNotes);
+    const filtered = transcriptions.filter(t => !t.isMeeting && !t.meetingNotes);
 
     libraryList.innerHTML = filtered.map((t, i) => renderTranscriptionCard(t, true, i * 0.05)).join('');
 
@@ -3710,11 +3377,6 @@ function setupSettingsListeners() {
             }
             if (settingKey === 'autoPolish') {
                 savePolishSettings();
-            } else if (settingKey === 'meetingCaptureEnabled') {
-                const mode = settings.meetingCaptureEnabled
-                    ? 'meeting'
-                    : ((settings.defaultMode === 'openai' || currentProvider === 'openai') ? 'openai' : 'gemini');
-                applyModeSelection(mode, { persist: true, syncMainProcess: true });
             }
         });
     });
@@ -3765,13 +3427,6 @@ function setupSettingsListeners() {
         geminiModelSelect.addEventListener('change', () => {
             settings.geminiModel = geminiModelSelect.value;
             api.setSettings({ geminiModel: settings.geminiModel });
-        });
-    }
-
-    if (meetingNotesModelSelect) {
-        meetingNotesModelSelect.addEventListener('change', () => {
-            settings.meetingNotesModel = meetingNotesModelSelect.value;
-            api.setSettings({ meetingNotesModel: settings.meetingNotesModel });
         });
     }
 
@@ -3991,8 +3646,6 @@ async function saveSettings() {
         customPolishPrompt: settings.customPolishPrompt,
         defaultProvider: settings.defaultMode,
         geminiModel: settings.geminiModel,
-        meetingCaptureEnabled: settings.meetingCaptureEnabled,
-        meetingNotesModel: settings.meetingNotesModel,
         hotkey: settings.hotkey,
         ...settings
     };
@@ -4006,7 +3659,6 @@ async function saveSettings() {
             const accelerator = hotkeyToAccelerator(settings.hotkey);
             await window.electronAPI.updateHotkey(accelerator);
         }
-        await syncMeetingModeToMainProcess();
         updateRecordingUI(isRecording);
     } catch (error) {
         console.error('Settings save error:', error);
@@ -4129,15 +3781,7 @@ async function loadSettings() {
         // Load consensus settings
         settings.consensusEnabled = data.consensusEnabled || false;
         settings.consensusMemoryEnabled = data.consensusMemoryEnabled !== false;
-        settings.meetingCaptureEnabled = data.meetingCaptureEnabled || false;
-        settings.meetingNotesModel = data.meetingNotesModel || 'gpt-5.2-2025-12-11';
         settings.speakerLabels = data.speakerLabels || {};
-
-        // Sync main-page meeting toggle
-        const mainMeetingToggle = document.getElementById('meetingToggleSwitch');
-        if (mainMeetingToggle) {
-            mainMeetingToggle.classList.toggle('active', !!settings.meetingCaptureEnabled);
-        }
 
         // Apply toggle settings to UI
         settingToggles.forEach(toggle => {
@@ -4167,16 +3811,13 @@ async function loadSettings() {
         }
 
         // Apply mode selection without persisting again
-        const initialMode = settings.defaultMode || (settings.meetingCaptureEnabled ? 'meeting' : 'gemini');
-        applyModeSelection(initialMode, { persist: false, syncMainProcess: false });
+        const initialMode = settings.defaultMode || 'gemini';
+        applyModeSelection(initialMode, { persist: false });
 
         // Apply Gemini model setting
         settings.geminiModel = data.geminiModel || 'gemini-3-flash-preview';
         if (geminiModelSelect) {
             geminiModelSelect.value = settings.geminiModel;
-        }
-        if (meetingNotesModelSelect) {
-            meetingNotesModelSelect.value = settings.meetingNotesModel;
         }
 
         // Load hotkey from Electron (source of truth) or fall back to settings.json
@@ -4201,7 +3842,6 @@ async function loadSettings() {
         }
         updateHotkeyDisplay();
         updateRecordingUI(isRecording);
-        syncMeetingModeToMainProcess();
     } catch (error) {
         console.error('Settings load error:', error);
     }
@@ -4310,7 +3950,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Settings
     setupSettingsListeners();
-    setupMeetingDetectionPromptListeners();
     setupLiveTranscriptPanelListeners();
     loadSettings();
 
@@ -4366,23 +4005,6 @@ document.addEventListener('DOMContentLoaded', () => {
         console.log('Electron: Reset recording state received');
         resetRecordingState();
     });
-
-    if (window.electronAPI.onMeetingModeSuggestion) {
-        window.electronAPI.onMeetingModeSuggestion((payload) => {
-            if (isRecording || settings.meetingCaptureEnabled) {
-                return;
-            }
-            showMeetingModeSuggestionPrompt(payload || {});
-        });
-    }
-
-    if (window.electronAPI.onMeetingModeUpdated) {
-        window.electronAPI.onMeetingModeUpdated((payload) => {
-            if (payload && payload.enabled === true) {
-                applyModeSelection('meeting', { persist: true, syncMainProcess: false });
-            }
-        });
-    }
 
     console.log('Electron IPC bridge initialized');
 })();

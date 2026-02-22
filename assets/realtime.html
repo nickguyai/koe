@@ -78,7 +78,7 @@
                         <p class="recording-hint" id="recordingHint">Tap to capture and transcribe</p>
                     </div>
 
-                    <!-- Mode Selector (three-segment) -->
+                    <!-- Mode Selector -->
                     <div class="mode-selector">
                         <button class="mode-option" data-mode="gemini" title="Batch processing, more accurate">
                             <span class="mode-label">Accuracy</span>
@@ -86,33 +86,6 @@
                         <button class="mode-option active" data-mode="openai" title="Real-time streaming, faster">
                             <span class="mode-label">Live</span>
                         </button>
-                        <button class="mode-option" data-mode="meeting" title="Meeting capture with notes and diarization">
-                            <span class="mode-label">Meeting</span>
-                        </button>
-                    </div>
-
-                    <!-- Meeting mode banner -->
-                    <div class="meeting-banner" id="meetingBanner" style="display: none;">
-                        <span class="meeting-banner-text">System audio + mic will be recorded. Transcript saved to library.</span>
-                    </div>
-
-                    <!-- Automatic meeting detection prompt -->
-                    <div class="meeting-detect-prompt" id="meetingDetectPrompt" style="display: none;">
-                        <div class="meeting-detect-prompt-header">
-                            <p class="meeting-detect-prompt-title">Meeting detected</p>
-                            <button class="meeting-detect-close" id="meetingDetectClose" aria-label="Dismiss meeting suggestion">&times;</button>
-                        </div>
-                        <p class="meeting-detect-prompt-message" id="meetingDetectPromptMessage">
-                            Looks like a meeting is starting. Switch to Meeting Capture?
-                        </p>
-                        <label class="meeting-detect-prompt-checkbox">
-                            <input type="checkbox" id="meetingDetectDontAskAgain">
-                            <span>Don't ask again for this app</span>
-                        </label>
-                        <div class="meeting-detect-prompt-actions">
-                            <button class="meeting-detect-btn subtle" id="meetingDetectNotNowBtn">Not now</button>
-                            <button class="meeting-detect-btn primary" id="meetingDetectSwitchBtn">Switch to Meeting</button>
-                        </div>
                     </div>
                 </div>
 
@@ -208,7 +181,6 @@
                 <div class="library-filters" id="libraryFilters">
                     <button class="filter-pill active" data-filter="all">All</button>
                     <button class="filter-pill" data-filter="dictation">Dictation</button>
-                    <button class="filter-pill" data-filter="meetings">Meetings</button>
                 </div>
 
                 <div class="library-list" id="libraryList">
@@ -275,30 +247,6 @@
                                     <div class="toggle-knob"></div>
                                 </div>
                             </div>
-                        </div>
-                    </section>
-
-                    <!-- Meeting Mode Settings -->
-                    <section class="settings-section">
-                        <h2 class="section-title">MEETING MODE</h2>
-
-                        <div class="settings-list">
-                            <div class="setting-toggle" data-setting="meetingCaptureEnabled">
-                                <div class="setting-info">
-                                    <p class="setting-label">Enable meeting capture mode</p>
-                                    <p class="setting-desc">Hotkey toggles continuous capture with live transcript, notes, and background diarization</p>
-                                </div>
-                                <div class="toggle-switch">
-                                    <div class="toggle-knob"></div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="setting-card">
-                            <label class="setting-select-label">Meeting notes model</label>
-                            <select id="meetingNotesModelSelect" class="setting-select">
-                                <option value="gpt-5.2-2025-12-11">GPT-5.2 (recommended)</option>
-                            </select>
                         </div>
                     </section>
 

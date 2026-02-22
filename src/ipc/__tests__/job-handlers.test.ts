@@ -50,19 +50,11 @@ function buildDeps() {
       polishText: vi.fn(),
     },
     jobQueue,
-    meetingNotesGenerator: null,
-    notionMcpService: null,
     memoryManager: null,
     getMainWindow: vi.fn(() => null),
     getOpenAIClient: vi.fn(() => null),
     setOpenAIClient: vi.fn(),
-    getRealtimeMeetingMode: vi.fn(() => false),
-    setRealtimeMeetingMode: vi.fn(),
-    getSystemAudioQueue: vi.fn(() => []),
-    startSystemAudioCapture: vi.fn(async () => true),
-    stopSystemAudioCapture: vi.fn(async () => {}),
     sendRealtimeEvent: vi.fn(),
-    generateMeetingNotesInBackground: vi.fn(async () => {}),
   } as any;
 
   return deps;
@@ -108,22 +100,22 @@ describe('registerJobHandlers live consensus routing', () => {
     });
   });
 
-  it('does not route meeting mode through consensus in live-audio-complete', async () => {
+  it('routes live-audio-complete through consensus even if meetingMode is present in payload', async () => {
     deps.jobQueue.getJob.mockReturnValue({
       id: 'job_meeting_1',
       provider: 'openai',
       audio_path: '/tmp/meeting.webm',
     });
-    deps.jobQueue.completeAudioOnlyJob.mockReturnValue({
-      job: { id: 'job_meeting_1', status: 'completed' },
-      result: { title: 'Meeting', summary: 'ok', speech_segments: [] },
+    deps.jobQueue.retranscribeJob.mockReturnValue({
+      id: 'job_meeting_1',
+      status: 'pending',
     });
 
     const handler = getHandler('live-audio-complete');
     await handler({}, { jobId: 'job_meeting_1', text: 'meeting text', meetingMode: true });
 
-    expect(deps.jobQueue.retranscribeJob).not.toHaveBeenCalled();
-    expect(deps.jobQueue.completeAudioOnlyJob).toHaveBeenCalled();
+    expect(deps.jobQueue.retranscribeJob).toHaveBeenCalledWith('job_meeting_1');
+    expect(deps.jobQueue.completeAudioOnlyJob).not.toHaveBeenCalled();
   });
 
   it('routes transcription-job-save fallback through audio-only + retranscribe when consensus is enabled', async () => {

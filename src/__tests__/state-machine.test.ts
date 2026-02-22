@@ -1,26 +1,30 @@
 import { describe, expect, it } from 'vitest';
 import { RecordingStateMachine } from '../state-machine';
 
-describe('RecordingStateMachine meeting mode', () => {
-  it('uses meeting states when meeting mode is enabled', () => {
-    const machine = new RecordingStateMachine();
-    machine.setMeetingMode(true);
-
-    expect(machine.transition('hotkey_press')).toBe(true);
-    expect(machine.currentState).toBe('meeting_recording');
-
-    expect(machine.transition('hotkey_press')).toBe(true);
-    expect(machine.currentState).toBe('meeting_processing');
-
-    expect(machine.transition('notes_complete')).toBe(true);
-    expect(machine.currentState).toBe('idle');
-  });
-
-  it('uses regular dictation states when meeting mode is disabled', () => {
-    const machine = new RecordingStateMachine();
-    machine.setMeetingMode(false);
+describe('RecordingStateMachine', () => {
+  it('uses dictation states from recording to insertion completion', () => {
+    const machine = new RecordingStateMachine(0);
 
     expect(machine.transition('hotkey_press')).toBe(true);
     expect(machine.currentState).toBe('recording');
+
+    expect(machine.transition('hotkey_press')).toBe(true);
+    expect(machine.currentState).toBe('processing');
+
+    expect(machine.transition('transcription_complete')).toBe(true);
+    expect(machine.currentState).toBe('inserting');
+
+    expect(machine.transition('insertion_complete')).toBe(true);
+    expect(machine.currentState).toBe('idle');
+  });
+
+  it('supports hotkey release to stop push-to-talk recording', () => {
+    const machine = new RecordingStateMachine(0);
+
+    expect(machine.transition('hotkey_press')).toBe(true);
+    expect(machine.currentState).toBe('recording');
+
+    expect(machine.transition('hotkey_release')).toBe(true);
+    expect(machine.currentState).toBe('processing');
   });
 });

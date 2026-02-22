@@ -1,7 +1,6 @@
 import { ipcMain } from 'electron';
 import { OpenAIRealtimeClient, RealtimeSegmentEvent, RealtimeStructuredEvent, RealtimeTextEvent } from '../backend/openai-realtime';
 import { LIVE_TRANSCRIPTION_PROMPT } from '../backend/prompts';
-import { mixPcmBuffers } from '../audio-mixer';
 import { IpcDependencies } from './types';
 
 export function registerRealtimeHandlers(deps: IpcDependencies): void {
@@ -24,19 +23,17 @@ export function registerRealtimeHandlers(deps: IpcDependencies): void {
     }
   };
 
-  ipcMain.handle('openai-realtime-start', async (_event, payload?: { meetingMode?: boolean }) => {
+  ipcMain.handle('openai-realtime-start', async () => {
     const apiKey = deps.configManager.getApiKey('openai');
     if (!apiKey) {
       throw new Error('OpenAI API key is not set');
     }
-    deps.setRealtimeMeetingMode(Boolean(payload?.meetingMode));
 
     const currentClient = deps.getOpenAIClient();
     if (currentClient) {
       await currentClient.disconnect();
       deps.setOpenAIClient(null);
     }
-    await deps.stopSystemAudioCapture();
 
     const settings = deps.configManager.getSettings();
     const language = settings.language || 'en';
@@ -67,13 +64,7 @@ export function registerRealtimeHandlers(deps: IpcDependencies): void {
     });
 
     deps.setOpenAIClient(openAIClient);
-
-    if (deps.getRealtimeMeetingMode()) {
-      await deps.startSystemAudioCapture();
-      await openAIClient.startMeeting();
-    } else {
-      await openAIClient.connect();
-    }
+    await openAIClient.connect();
 
     return true;
   });
@@ -86,39 +77,20 @@ export function registerRealtimeHandlers(deps: IpcDependencies): void {
       if (!openAIClient) {
         return;
       }
-      if (!deps.getRealtimeMeetingMode()) {
-        await openAIClient.sendAudio(micBuffer);
-        return;
-      }
-
-      // Dequeue one system audio chunk per mic frame for temporal alignment.
-      // If no system chunk available, mix with silence (null).
-      const systemAudioQueue = deps.getSystemAudioQueue();
-      const systemChunk = systemAudioQueue.shift() ?? null;
-      const mixed = mixPcmBuffers(micBuffer, systemChunk);
-      await openAIClient.sendAudio(mixed.length > 0 ? mixed : micBuffer);
+      await openAIClient.sendAudio(micBuffer);
     });
   });
 
-  ipcMain.handle('openai-realtime-stop', async (_event, payload?: { meetingMode?: boolean }) => {
-    const isMeeting = Boolean(payload?.meetingMode) || deps.getRealtimeMeetingMode();
+  ipcMain.handle('openai-realtime-stop', async () => {
     const openAIClient = deps.getOpenAIClient();
     if (openAIClient) {
       await waitForAudioIngressToSettle();
-      if (isMeeting) {
-        const transcript = await openAIClient.stopMeeting();
-        await deps.stopSystemAudioCapture();
-        deps.setRealtimeMeetingMode(false);
-        return { transcript };
-      }
       await openAIClient.commitAudio();
     }
     return true;
   });
 
   ipcMain.handle('openai-realtime-disconnect', async () => {
-    deps.setRealtimeMeetingMode(false);
-    await deps.stopSystemAudioCapture();
     audioIngressQueue = Promise.resolve();
     lastAudioIngressAt = 0;
     const openAIClient = deps.getOpenAIClient();
