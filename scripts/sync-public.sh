@@ -29,6 +29,7 @@ node -e "
 const fs = require('fs');
 const pkg = JSON.parse(fs.readFileSync('$RELEASE_DIR/package.json', 'utf8'));
 pkg.build.mac.notarize = false;
+delete pkg.build.afterSign;
 delete pkg.build.afterPack;
 fs.writeFileSync('$RELEASE_DIR/package.json', JSON.stringify(pkg, null, 2) + '\n');
 "

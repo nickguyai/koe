@@ -1,6 +1,6 @@
 {
   "name": "koe",
-  "version": "1.0.14",
+  "version": "1.0.17",
   "description": "Voice transcription with global hotkey support",
   "main": "dist/main.js",
   "scripts": {
@@ -43,8 +43,7 @@
       "notarize": false,
       "category": "public.app-category.productivity",
       "target": [
-        "dmg",
-        "zip"
+        "dmg"
       ],
       "icon": "assets/icon.icns",
       "entitlements": "entitlements.mac.plist",
