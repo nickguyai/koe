@@ -157,7 +157,7 @@ describe('OpenAIRealtimeClient', () => {
     expect(session.turn_detection).toBeNull();
   });
 
-  it('applies tuned server_vad settings in meeting mode', async () => {
+  it('disables turn_detection in meeting mode', async () => {
     const client = new OpenAIRealtimeClient('test-key', 'test-model', 'gpt-4o-transcribe', 'prompt');
     const ws = await connectClient(client, 'meeting');
 
@@ -165,11 +165,7 @@ describe('OpenAIRealtimeClient', () => {
     expect(sessionUpdate).toBeDefined();
 
     const session = (sessionUpdate!.session || {}) as Record<string, unknown>;
-    expect(session.turn_detection).toEqual({
-      type: 'server_vad',
-      silence_duration_ms: 700,
-      prefix_padding_ms: 500,
-    });
+    expect(session.turn_detection).toBeNull();
   });
 
   it('sends response.create after commitAudio in single mode when instructions are set', async () => {
@@ -207,7 +203,7 @@ describe('OpenAIRealtimeClient', () => {
     expect(appendMessages).toHaveLength(2);
   });
 
-  it('stopMeeting skips commitAudio and waits for trailing segments', async () => {
+  it('stopMeeting calls commitAudio then waits for trailing segments', async () => {
     const client = new OpenAIRealtimeClient('test-key');
     const waitSpy = vi
       .spyOn(client as unknown as { waitForMeetingSegments: (timeout: number) => Promise<void> }, 'waitForMeetingSegments')
@@ -219,9 +215,9 @@ describe('OpenAIRealtimeClient', () => {
     await client.stopMeeting();
     expect(waitSpy).toHaveBeenCalledWith(5000);
 
-    // No input_audio_buffer.commit should be sent by stopMeeting
+    // commitAudio must be called so the buffered audio is processed
     const types = typedMessages(ws);
-    expect(types).not.toContain('input_audio_buffer.commit');
+    expect(types).toContain('input_audio_buffer.commit');
   });
 
   it('stopMeeting flushes queued audio before starting segment wait', async () => {
@@ -425,37 +421,4 @@ describe('OpenAIRealtimeClient', () => {
     expect(textHandler).toHaveBeenNthCalledWith(2, { content: 'hello world', isNewResponse: true });
   });
 
-  it('falls back to ASR transcript when unmarked response looks conversational', async () => {
-    const client = new OpenAIRealtimeClient('test-key', 'test-model', 'gpt-4o-transcribe', 'prompt');
-    const ws = await connectClient(client, 'single');
-    const textHandler = vi.fn();
-
-    client.on('text', textHandler);
-
-    ws.emit(
-      'message',
-      Buffer.from(
-        JSON.stringify({
-          type: 'conversation.item.input_audio_transcription.completed',
-          transcript: 'book a meeting tomorrow at 3 PM',
-        }),
-      ),
-    );
-    ws.emit(
-      'message',
-      Buffer.from(
-        JSON.stringify({
-          type: 'response.text.delta',
-          delta: "I'm sorry, but I can only transcribe spoken words. Please provide the speech you want transcribed.",
-        }),
-      ),
-    );
-    ws.emit('message', Buffer.from(JSON.stringify({ type: 'response.done' })));
-
-    expect(textHandler).toHaveBeenCalledTimes(1);
-    expect(textHandler).toHaveBeenNthCalledWith(1, {
-      content: 'book a meeting tomorrow at 3 PM',
-      isNewResponse: true,
-    });
-  });
 });

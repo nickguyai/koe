@@ -20,13 +20,6 @@ export interface RealtimeStructuredEvent {
 }
 
 const BRAINWAVE_MARKER_PREFIX = '下面是不改变语言的语音识别结果：\n\n';
-const CONVERSATIONAL_RESPONSE_PATTERNS = [
-  /\bI can only transcribe\b/i,
-  /\bPlease provide (the )?speech\b/i,
-  /\bI('m| am) sorry\b/i,
-  /\bas an AI\b/i,
-  /^\s*(sure|ok|okay|of course)\b/i,
-];
 
 export class OpenAIRealtimeClient extends EventEmitter {
   private apiKey: string;
@@ -44,7 +37,6 @@ export class OpenAIRealtimeClient extends EventEmitter {
   private responsePrefixBuffer: string[] = [];
   private markerSeen = false;
   private markerMatched = false;
-  private singleAsrSegments: string[] = [];
   private readyResolver: (() => void) | null = null;
   private readyRejecter: ((err: Error) => void) | null = null;
   private readyPromise: Promise<void> | null = null;
@@ -61,7 +53,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
 
   constructor(
     apiKey: string,
-    model: string = 'gpt-realtime-2025-08-28',
+    model: string = 'gpt-realtime-mini-2025-12-15',
     transcriptionModel: string = 'gpt-4o-transcribe',
     instructions?: RealtimeInstructions,
     language?: string,
@@ -154,9 +146,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
     // Flush any queued audio appends before starting the shutdown timer
     await this.sendQueue;
 
-    // server_vad auto-commits audio; just set timestamp for waitForMeetingSegments()
-    this.commitAudioAt = Date.now();
-    this.emitStatus('processing');
+    await this.commitAudio();
 
     await this.waitForMeetingSegments(5000);
     const transcript = this.meetingSegments.join('\n').trim();
@@ -193,7 +183,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
     // Send ~500ms of trailing silence (PCM16 zeros) before committing.
     // At 24kHz mono PCM16, 500ms = 12000 samples = 24000 bytes.
     // This prevents OpenAI from truncating the final word/syllable when
-    // turn_detection is null (single mode) and audio ends abruptly.
+    // turn_detection is null and audio ends abruptly.
     const silenceBytes = 24000;
     const silence = Buffer.alloc(silenceBytes, 0);
     await this.enqueueSend(
@@ -290,19 +280,10 @@ export class OpenAIRealtimeClient extends EventEmitter {
       return;
     }
 
-    const turnDetection =
-      this.sessionMode === 'meeting'
-        ? {
-            type: 'server_vad',
-            silence_duration_ms: 700,
-            prefix_padding_ms: 500,
-          }
-        : null;
-
     const session: Record<string, unknown> = {
       modalities: ['text'],
       input_audio_format: 'pcm16',
-      turn_detection: turnDetection,
+      turn_detection: null,
       input_audio_transcription: {
         model: this.transcriptionModel,
         ...(this.language ? { language: this.language } : {}),
@@ -433,10 +414,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
       if (transcript) {
         if (this.sessionMode === 'meeting') {
           this.appendMeetingSegment(transcript);
-        } else if (this.hasInstructions()) {
-          // Keep ASR as a fallback when prompt-guided response deviates.
-          this.singleAsrSegments.push(transcript);
-        } else {
+        } else if (!this.hasInstructions()) {
           this.emit('text', { content: transcript, isNewResponse: true } as RealtimeTextEvent);
         }
       }
@@ -500,7 +478,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
 
     if (type === 'error') {
       const messageText = String((data as { error?: { message?: string } }).error?.message || 'OpenAI error');
-      // server_vad auto-commits; suppress benign empty-buffer errors in meeting mode
+      // suppress benign empty-buffer errors in meeting mode
       if (this.sessionMode === 'meeting' && messageText.includes('buffer too small')) {
         return;
       }
@@ -533,12 +511,6 @@ export class OpenAIRealtimeClient extends EventEmitter {
     }
 
     const raw = (this.currentResponseText || '').trim();
-    const fallbackAsrText = this.singleAsrSegments.join('\n').trim();
-    const shouldUseAsrFallback =
-      this.sessionMode === 'single' &&
-      this.hasInstructions() &&
-      Boolean(fallbackAsrText) &&
-      (!this.markerMatched || this.looksConversational(raw));
     this.resetSingleResponseState();
 
     const parsed = this.tryParseStructuredResult(raw);
@@ -550,9 +522,6 @@ export class OpenAIRealtimeClient extends EventEmitter {
     if (parsed && Array.isArray((parsed as { speech_segments?: unknown }).speech_segments)) {
       const segments = (parsed as { speech_segments?: Array<{ content?: string }> }).speech_segments || [];
       finalText = segments.map((seg) => seg.content || '').filter(Boolean).join('\n');
-    }
-    if (shouldUseAsrFallback) {
-      finalText = fallbackAsrText;
     }
 
     if (finalText) {
@@ -663,15 +632,6 @@ export class OpenAIRealtimeClient extends EventEmitter {
     this.responsePrefixBuffer = [];
     this.markerSeen = false;
     this.markerMatched = false;
-    this.singleAsrSegments = [];
-  }
-
-  private looksConversational(text: string): boolean {
-    const source = String(text || '').trim();
-    if (!source) {
-      return true;
-    }
-    return CONVERSATIONAL_RESPONSE_PATTERNS.some((pattern) => pattern.test(source));
   }
 
   private hasInstructions(): boolean {

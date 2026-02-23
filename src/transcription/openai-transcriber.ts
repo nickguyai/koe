@@ -1,188 +1,90 @@
-import OpenAI from 'openai';
 import * as fs from 'fs';
-import * as path from 'path';
 import { spawn } from 'child_process';
 import { ConfigManager } from '../config/config-manager';
 import { getFfmpegPath } from '../audio/ffmpeg-paths';
-import { buildConsensusVariantPrompt, ConsensusVariant, VariantResult } from './prompts';
+import { OpenAIRealtimeClient } from '../realtime/openai-realtime';
+import { ConsensusVariant, VariantResult } from './prompts';
+
+// 1 second of PCM16 at 24kHz mono = 48 000 bytes — keeps WebSocket messages small.
+const AUDIO_CHUNK_BYTES = 48000;
 
 export class OpenAITranscriber {
   private config: ConfigManager;
-  private client: OpenAI | null = null;
-  private clientKey: string | null = null;
 
   constructor(config: ConfigManager) {
     this.config = config;
   }
 
-  private getClient(): OpenAI {
-    const apiKey = this.config.getApiKey('openai');
-    if (!apiKey) {
-      throw new Error('OpenAI API key is not set.');
-    }
-    if (!this.client || this.clientKey !== apiKey) {
-      this.client = new OpenAI({ apiKey });
-      this.clientKey = apiKey;
-    }
-    return this.client;
-  }
+  private async convertToPcm16(audioPath: string, variant: string): Promise<{ path: string; cleanup: () => Promise<void> }> {
+    const pcmPath = audioPath.replace(/\.[^.]+$/, `_realtime_${variant}.pcm`);
 
-  private async convertToWavIfNeeded(audioPath: string): Promise<{ path: string; cleanup?: () => Promise<void> }> {
-    const ext = path.extname(audioPath).toLowerCase();
-    // Chat Completions input_audio accepts wav/mp3 payload labeling.
-    // Normalize everything else to wav to avoid mismatched format/data errors.
-    if (ext === '.wav' || ext === '.mp3') {
-      return { path: audioPath };
-    }
-
-    const convertedPath = ext
-      ? audioPath.replace(new RegExp(`\\${ext}$`, 'i'), '_converted.wav')
-      : `${audioPath}_converted.wav`;
-
-    const conversionOk = await new Promise<boolean>((resolve) => {
-      const child = spawn(getFfmpegPath(), ['-y', '-i', audioPath, '-ar', '16000', '-ac', '1', convertedPath], {
-        stdio: 'ignore',
-      });
-
-      child.on('error', (err) => {
-        console.warn('ffmpeg not available or failed to start:', err);
-        resolve(false);
-      });
-
-      child.on('close', (code) => {
-        resolve(code === 0 && fs.existsSync(convertedPath));
-      });
+    const ok = await new Promise<boolean>((resolve) => {
+      const child = spawn(
+        getFfmpegPath(),
+        ['-y', '-i', audioPath, '-ar', '24000', '-ac', '1', '-f', 's16le', pcmPath],
+        { stdio: 'ignore' },
+      );
+      child.on('error', () => resolve(false));
+      child.on('close', (code) => resolve(code === 0 && fs.existsSync(pcmPath)));
     });
 
-    if (!conversionOk) {
-      throw new Error(`Failed to convert audio to wav for OpenAI transcription: ${audioPath}`);
+    if (!ok) {
+      throw new Error(`Failed to convert audio to PCM16 for Realtime transcription: ${audioPath}`);
     }
 
     return {
-      path: convertedPath,
+      path: pcmPath,
       cleanup: async () => {
         try {
-          await fs.promises.unlink(convertedPath);
+          await fs.promises.unlink(pcmPath);
         } catch {
-          // Ignore cleanup failures
+          // ignore cleanup failures
         }
       },
     };
   }
 
-  private guessMimeType(filePath: string): string {
-    const ext = path.extname(filePath).toLowerCase();
-    switch (ext) {
-      case '.m4a':
-        return 'audio/mp4';
-      case '.mp3':
-        return 'audio/mpeg';
-      case '.wav':
-        return 'audio/wav';
-      case '.ogg':
-        return 'audio/ogg';
-      case '.flac':
-        return 'audio/flac';
-      case '.webm':
-        return 'audio/webm';
-      default:
-        return 'audio/wav';
-    }
-  }
-
-  private extractJsonPayload(responseText: string): VariantResult {
-    let cleaned = responseText.trim();
-    if (cleaned.startsWith('```')) {
-      const lines = cleaned.split('\n');
-      if (lines[0].startsWith('```')) {
-        lines.shift();
-      }
-      if (lines.length && lines[lines.length - 1].trim().startsWith('```')) {
-        lines.pop();
-      }
-      cleaned = lines.join('\n').trim();
+  async transcribeAudio(audioPath: string, variant: ConsensusVariant, _memoryTerms?: string[]): Promise<VariantResult> {
+    const apiKey = this.config.getApiKey('openai');
+    if (!apiKey) {
+      throw new Error('OpenAI API key is not set.');
     }
 
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
-    if (start === -1 || end === -1 || end <= start) {
-      throw new Error('No JSON object found in OpenAI response.');
-    }
-
-    let jsonStr = cleaned.slice(start, end + 1);
-    jsonStr = jsonStr.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
-    jsonStr = jsonStr.replace(/\\u(?![0-9a-fA-F]{4})/g, '');
-    jsonStr = jsonStr.replace(/\\(?!["\\/bfnrtu])/g, '');
-
-    try {
-      const parsed = JSON.parse(jsonStr);
-      return {
-        variant: 'base',
-        title: parsed.title || 'Transcription',
-        segments: parsed.segments || [],
-        summary: parsed.summary || '',
-      };
-    } catch (err) {
-      throw new Error(`Failed to parse OpenAI response JSON: ${err}`);
-    }
-  }
-
-  async transcribeAudio(audioPath: string, variant: ConsensusVariant, memoryTerms?: string[]): Promise<VariantResult> {
-    const client = this.getClient();
     const settings = this.config.getSettings();
+    const lang = settings.language && settings.language !== 'auto' ? settings.language : undefined;
 
-    const prompt = buildConsensusVariantPrompt(
-      variant,
-      {
-        autoDetectSpeakers: settings.autoDetectSpeakers,
-        timestamps: settings.timestamps,
-        punctuation: settings.punctuation,
-        language: settings.language,
-        summaryLength: settings.summaryLength,
-      },
-      memoryTerms,
-    );
-
-    const { path: workingPath, cleanup } = await this.convertToWavIfNeeded(audioPath);
+    const { path: pcmPath, cleanup } = await this.convertToPcm16(audioPath, variant);
     try {
-      const ext = path.extname(workingPath).toLowerCase();
-      if (ext !== '.wav' && ext !== '.mp3') {
-        throw new Error(`OpenAI transcription requires wav/mp3 input, got: ${workingPath}`);
-      }
-      const audioBytes = await fs.promises.readFile(workingPath);
-      const base64Audio = audioBytes.toString('base64');
-      const audioFormat = ext === '.wav' ? 'wav' : 'mp3';
+      const client = new OpenAIRealtimeClient(apiKey, undefined, undefined, undefined, lang);
+      const segments: Array<{ content: string }> = [];
 
-      const response = await client.chat.completions.create({
-        model: 'gpt-4o-audio-preview',
-        modalities: ['text'],
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              {
-                type: 'input_audio',
-                input_audio: {
-                  data: base64Audio,
-                  format: audioFormat,
-                },
-              },
-            ],
-          },
-        ],
-        temperature: 0.3,
-        max_tokens: 4096,
+      // Register error listener synchronously before startMeeting() so that
+      // websocket failures, invalid API keys, and quota/rate errors are caught
+      // here rather than crashing the process with ERR_UNHANDLED_ERROR.
+      await new Promise<void>((resolve, reject) => {
+        client.on('error', (message: string) => reject(new Error(message)));
+        client.on('segment', (event: { segment: string }) => {
+          segments.push({ content: event.segment });
+        });
+
+        (async () => {
+          await client.startMeeting();
+          const pcmBuffer = await fs.promises.readFile(pcmPath);
+          for (let offset = 0; offset < pcmBuffer.length; offset += AUDIO_CHUNK_BYTES) {
+            await client.sendAudio(pcmBuffer.slice(offset, offset + AUDIO_CHUNK_BYTES));
+          }
+          await client.stopMeeting();
+        })().then(resolve, reject);
       });
 
-      const responseText = response.choices[0]?.message?.content || '';
-      const result = this.extractJsonPayload(responseText);
-      result.variant = variant;
-      return result;
+      return {
+        variant,
+        title: 'Transcription',
+        segments,
+        summary: '',
+      };
     } finally {
-      if (cleanup) {
-        await cleanup();
-      }
+      await cleanup();
     }
   }
 }

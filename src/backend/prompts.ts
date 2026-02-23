@@ -3,7 +3,6 @@ export {
   buildTranscriptionPrompt,
   buildChunkTranscriptionPrompt,
   buildPolishPrompt,
-  buildConsensusVariantPrompt,
   buildSynthesisPrompt,
   LIVE_TRANSCRIPTION_PROMPT,
   MEETING_NOTES_PROMPT,
