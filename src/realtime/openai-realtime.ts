@@ -19,7 +19,7 @@ export interface RealtimeStructuredEvent {
   result: Record<string, unknown>;
 }
 
-const BRAINWAVE_MARKER_PREFIX = '下面是不改变语言的语音识别结果：\n\n';
+const BRAINWAVE_MARKER_PREFIX = 'The following is the speech recognition result in the original language:\n\n';
 
 export class OpenAIRealtimeClient extends EventEmitter {
   private apiKey: string;
@@ -53,7 +53,7 @@ export class OpenAIRealtimeClient extends EventEmitter {
 
   constructor(
     apiKey: string,
-    model: string = 'gpt-realtime-mini-2025-12-15',
+    model: string = 'gpt-realtime-2025-08-28',
     transcriptionModel: string = 'gpt-4o-transcribe',
     instructions?: RealtimeInstructions,
     language?: string,
